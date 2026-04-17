@@ -1,0 +1,16 @@
+# Compiled binaries (both the local go-build output and release artefacts)
+/cchist
+/cchist-*
+/dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Go tooling
+/vendor/
+*.test
+*.out
+coverage.*
