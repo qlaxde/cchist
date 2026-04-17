@@ -19,7 +19,7 @@ import (
 type commonFlags struct {
 	Limit             int
 	Project           string
-	Cwd               bool
+	All               bool // override the default cwd-scoped lookup
 	Since             string
 	JSON              bool
 	Verbose           bool
@@ -34,7 +34,8 @@ func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.IntVar(&c.Limit, "limit", 10, "max results")
 	fs.StringVar(&c.Project, "p", "", "filter by project substring (matches cwd)")
 	fs.StringVar(&c.Project, "project", "", "filter by project substring (matches cwd)")
-	fs.BoolVar(&c.Cwd, "cwd", false, "limit to current working directory")
+	fs.BoolVar(&c.All, "all", false, "search across all projects (default: current dir only)")
+	fs.BoolVar(&c.All, "a", false, "search across all projects (shorthand for --all)")
 	fs.StringVar(&c.Since, "since", "", "recency filter (ISO date or e.g. 7d, 12h, 2w)")
 	fs.BoolVar(&c.JSON, "json", false, "machine-readable JSON output")
 	fs.BoolVar(&c.Verbose, "v", false, "log indexing progress to stderr")
@@ -43,6 +44,22 @@ func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.BoolVar(&c.IncludeDeprecated, "include-deprecated", false, "include sessions marked deprecated")
 	fs.BoolVar(&c.IncludeCompleted, "include-completed", true, "include completed sessions (default true)")
 	fs.BoolVar(&c.ShowForks, "show-forks", false, "don't dedup fork siblings (show every match)")
+}
+
+// resolveCwdScope returns the directory to filter on, or "" when the caller
+// should not apply any cwd restriction. The rules are:
+//   - --all or -a → no cwd filter (empty string)
+//   - --project <substr> → no cwd filter (substring is the filter)
+//   - otherwise → current working directory
+//
+// Centralising this keeps the three subcommands (search, list, threads)
+// behaving identically without each re-deriving the rule.
+func resolveCwdScope(c *commonFlags) string {
+	if c.All || c.Project != "" {
+		return ""
+	}
+	cwd, _ := os.Getwd()
+	return cwd
 }
 
 func main() {
@@ -151,13 +168,16 @@ Memory / processes:
   cchist running                 running claude processes with status + RSS
   cchist reap                    SIGTERM (then SIGKILL) running-and-completed sessions
 
+Scope (search / list / threads default to the current working directory):
+  -a, --all             search across all projects
+  -p, --project S       filter by project substring (overrides default cwd)
+
 Common flags:
   -n, --limit N         max results (default 10)
-  -p, --project S       filter by project substring
-  --cwd                 limit to current working directory
   --since SPEC          ISO date or 7d / 12h / 2w
   --json                machine-readable output
   --include-deprecated  include soft-hidden sessions
+  --show-forks          don't dedup fork siblings in search results
   -v, --verbose         log indexing progress
   --reindex             force full reindex before running
 
@@ -267,10 +287,7 @@ func cmdSearch(argv []string) error {
 	if err != nil {
 		return err
 	}
-	cwdFilter := ""
-	if c.Cwd {
-		cwdFilter, _ = os.Getwd()
-	}
+	cwdFilter := resolveCwdScope(&c)
 
 	// Over-fetch so post-filters don't starve the result set.
 	want := c.Limit
@@ -309,13 +326,24 @@ func cmdSearch(argv []string) error {
 		return emitJSON(results, qterms, context)
 	}
 	if len(results) == 0 {
-		fmt.Fprintln(os.Stderr, "no matches")
+		fmt.Fprintln(os.Stderr, emptyHint(cwdFilter, "matches"))
 		return nil
 	}
 	for _, r := range results {
 		printResult(r, qterms, context)
 	}
 	return nil
+}
+
+// emptyHint explains "why was this empty" when the default cwd-scoped view
+// returns no rows. If the user ran without --all, there may actually be hits
+// elsewhere — telling them so prevents the "wait, that can't be right"
+// confusion of the new default.
+func emptyHint(cwdFilter, noun string) string {
+	if cwdFilter == "" {
+		return "no " + noun
+	}
+	return fmt.Sprintf("no %s in %s — try --all to search everywhere", noun, shortProject(cwdFilter))
 }
 
 type scoredTurn struct {
@@ -405,10 +433,7 @@ func cmdList(argv []string) error {
 	if err != nil {
 		return err
 	}
-	cwdFilter := ""
-	if c.Cwd {
-		cwdFilter, _ = os.Getwd()
-	}
+	cwdFilter := resolveCwdScope(&c)
 
 	meta := loadMetadata()
 	rows := make([]*sessionRow, 0, len(byID))
@@ -416,7 +441,7 @@ func cmdList(argv []string) error {
 		if c.Project != "" && !strings.Contains(strings.ToLower(r.Project), strings.ToLower(c.Project)) {
 			continue
 		}
-		if cwdFilter != "" && r.Project != cwdFilter {
+		if cwdFilter != "" && !cwdMatches(r.Project, cwdFilter) {
 			continue
 		}
 		if !since.IsZero() {
@@ -437,6 +462,10 @@ func cmdList(argv []string) error {
 
 	if c.JSON {
 		return json.NewEncoder(os.Stdout).Encode(rows)
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(os.Stderr, emptyHint(cwdFilter, "sessions"))
+		return nil
 	}
 	for _, r := range rows {
 		header := strings.Join(filterEmpty([]string{
@@ -606,7 +635,7 @@ func parseTS(s string) (time.Time, bool) {
 }
 
 func matchFilters(t Turn, project, cwd string, since time.Time) bool {
-	if cwd != "" && t.Project != cwd {
+	if cwd != "" && !cwdMatches(t.Project, cwd) {
 		return false
 	}
 	if project != "" && !strings.Contains(strings.ToLower(t.Project), strings.ToLower(project)) {
@@ -619,6 +648,30 @@ func matchFilters(t Turn, project, cwd string, since time.Time) bool {
 		}
 	}
 	return true
+}
+
+// cwdMatches implements project-aware cwd scoping. A session belongs to the
+// "current project" when either:
+//
+//   - the user's cwd sits inside the session's recorded project root (I'm in
+//     /repo/apps/admin; the session ran at /repo — include it), OR
+//   - the session's recorded project sits inside the user's cwd (I'm at /repo
+//     and the session was deep inside it — include it too).
+//
+// We compare with trailing slashes appended so /foo doesn't leak into /foobar.
+// The git-root / worktree resolution that the history-viewer does at decode
+// time isn't needed here because Claude Code's transcripts already record the
+// real cwd, so this pure prefix check covers the cases that matter.
+func cwdMatches(sessionProject, cwd string) bool {
+	if sessionProject == "" || cwd == "" {
+		return false
+	}
+	if sessionProject == cwd {
+		return true
+	}
+	sp := strings.TrimSuffix(sessionProject, "/") + "/"
+	cp := strings.TrimSuffix(cwd, "/") + "/"
+	return strings.HasPrefix(cp, sp) || strings.HasPrefix(sp, cp)
 }
 
 // --- rendering -------------------------------------------------------------

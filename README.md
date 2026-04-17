@@ -39,17 +39,23 @@ curl -L https://github.com/qlaxde/cchist/releases/latest/download/cchist-linux-a
 
 ### Search
 
+**Default scope is the current project.** `search`, `list`, and `threads` all filter to the directory you're in (matched by prefix so a subdir like `apps/admin` still resolves to its repo root). Use `--all` / `-a` to broaden.
+
 ```bash
-cchist "sip gemini realtime"        # default: BM25 search
-cchist --cwd "type error"            # limit to current project
-cchist --since 7d "migration"        # recent hits only
-cchist --show-forks "…"              # don't dedup fork siblings (see below)
+cchist "sip gemini realtime"      # default: current project only
+cchist -a "sip gemini realtime"   # all projects
+cchist -p marketplace "…"          # filter by substring of the cwd path
+cchist --since 7d "migration"      # recent hits only
+cchist --show-forks "…"            # don't dedup fork siblings (see below)
 ```
+
+When no hits match the default scope, cchist prints a hint pointing at `--all`.
 
 ### Browse
 
 ```bash
-cchist list                           # sessions newest first
+cchist list                           # sessions in current project, newest first
+cchist list -a                        # across all projects
 cchist show <session-prefix>          # print a full session
 cchist show <session-prefix> 12       # print just turn #12
 ```
@@ -59,8 +65,9 @@ cchist show <session-prefix> 12       # print just turn #12
 Each Claude REPL you leave open leaks ~200 MB/hour. The reason you leave them open: they represent unfinished work you're afraid to lose. `cchist threads` surfaces them so you can close safely.
 
 ```bash
-cchist threads                        # all open sessions, newest first
-cchist threads --cwd                  # scoped to current project
+cchist threads                        # open threads in current project
+cchist threads -a                     # across all projects
+cchist threads --closed               # include completed + deprecated
 cchist done                           # mark the most recent session complete
 cchist done --family <id>             # also complete every fork of that session
 ```

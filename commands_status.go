@@ -148,7 +148,7 @@ func cmdDone(argv []string) error {
 	cwd, _ := os.Getwd()
 	var pick *sessionSummary
 	for _, s := range summaries {
-		if !*global && s.Project != cwd {
+		if !*global && !cwdMatches(s.Project, cwd) {
 			continue
 		}
 		if s.Status == "completed" {
@@ -313,7 +313,10 @@ func cmdThreads(argv []string) error {
 	fs := flag.NewFlagSet("threads", flag.ContinueOnError)
 	var c commonFlags
 	bindCommon(fs, &c)
-	all := fs.Bool("all", false, "include completed and deprecated")
+	// --closed surfaces completed/deprecated threads too. Kept out of
+	// commonFlags because it only makes sense here — search and list don't
+	// hide completed sessions by default.
+	closed := fs.Bool("closed", false, "include completed and deprecated threads")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -333,14 +336,11 @@ func cmdThreads(argv []string) error {
 	if err != nil {
 		return err
 	}
-	cwdFilter := ""
-	if c.Cwd {
-		cwdFilter, _ = os.Getwd()
-	}
+	cwdFilter := resolveCwdScope(&c)
 
 	rows := make([]*sessionSummary, 0, len(summaries))
 	for _, s := range summaries {
-		if !*all {
+		if !*closed {
 			if s.Status == "completed" {
 				continue
 			}
@@ -351,7 +351,7 @@ func cmdThreads(argv []string) error {
 		if c.Project != "" && !strings.Contains(strings.ToLower(s.Project), strings.ToLower(c.Project)) {
 			continue
 		}
-		if cwdFilter != "" && s.Project != cwdFilter {
+		if cwdFilter != "" && !cwdMatches(s.Project, cwdFilter) {
 			continue
 		}
 		if !since.IsZero() {
@@ -380,7 +380,7 @@ func cmdThreads(argv []string) error {
 	}
 
 	if len(groups) == 0 {
-		fmt.Fprintln(os.Stderr, "no open threads")
+		fmt.Fprintln(os.Stderr, emptyHint(cwdFilter, "open threads"))
 		return nil
 	}
 
