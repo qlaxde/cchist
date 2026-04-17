@@ -35,6 +35,36 @@ curl -L https://github.com/qlaxde/cchist/releases/latest/download/cchist-darwin-
 curl -L https://github.com/qlaxde/cchist/releases/latest/download/cchist-linux-amd64 -o cchist
 ```
 
+### Let an agent install it
+
+Paste the prompt below into a fresh Claude Code session (or any agent CLI that can read/write your filesystem and edit JSON) to install cchist end-to-end — binary, archive seed, and lifecycle hooks — without running the steps by hand:
+
+```
+Install cchist from https://github.com/qlaxde/cchist end-to-end. Do every step; stop and ask only if something fails.
+
+1. Detect my OS and CPU arch with `uname -s` and `uname -m`. Map to one of: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Refuse to proceed on any other platform.
+
+2. Download the matching binary from
+   https://github.com/qlaxde/cchist/releases/latest/download/cchist-<os>-<arch>
+   Install it at ~/.local/bin/cchist (mkdir -p the directory), chmod +x. If ~/.local/bin is not on PATH, tell me the exact shell-rc line to add.
+
+3. Verify with `cchist help` — it should print the usage banner.
+
+4. Run `cchist archive` once to snapshot my existing ~/.claude/projects transcripts and ~/.claude/plans into the durable archive. Report how many sessions and plans were archived.
+
+5. Install three lifecycle hooks in ~/.claude/settings.json: PreCompact, SessionStart, SessionEnd. Each runs the command
+      /Users/<me>/.local/bin/cchist hook 2>/dev/null || true
+   with timeouts of 10s, 5s, 10s respectively (use the absolute path — hooks don't inherit my shell PATH).
+
+   CRITICAL: READ the existing settings.json first and MERGE into the hooks object. Do NOT replace it. I probably have other hooks (formatters, MCP compressors, statusline, etc.) — preserve every one. Validate the final file with `jq -e .` before saving; abort if invalid.
+
+6. Tell me the hooks won't take effect in my already-running Claude sessions — I need to open `/hooks` once (which reloads settings) or start a new session. Offer to also add a one-liner verifier hook command I can paste into `/hooks` to confirm `cchist hook` fires.
+
+7. Report: binary path, binary size, archive totals, exactly which hook entries you added, and link me to the README for workflow commands: https://github.com/qlaxde/cchist/blob/main/README.md
+```
+
+The prompt is deliberately explicit — every step references a specific artefact, and the settings.json step spells out the merge/validate dance so the agent doesn't clobber existing hooks.
+
 ## Usage
 
 ### Search
