@@ -4,29 +4,121 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
-	"regexp"
 	"sort"
 	"strings"
 )
+
+// Block is one piece of structured assistant-side content within a Turn. Tool
+// results from follow-up user messages are stitched in here too, since they
+// continue the assistant's work. Keeping blocks typed lets `cchist show`
+// filter at display time (drop thinking, drop tool calls, etc.) without
+// having to re-parse the source JSONL.
+type Block struct {
+	Kind string // BlockText | BlockThinking | BlockToolUse | BlockToolResult
+	Name string // tool name on BlockToolUse; empty otherwise
+	Text string // body: text/thinking content, tool input summary, or truncated tool result
+}
+
+const (
+	BlockText       = "text"
+	BlockThinking   = "thinking"
+	BlockToolUse    = "tool_use"
+	BlockToolResult = "tool_result"
+)
+
+// Render returns the inline string form of a block as it appears both in the
+// search blob and in `show` output.
+func (b Block) Render() string {
+	switch b.Kind {
+	case BlockText, BlockThinking:
+		return b.Text
+	case BlockToolUse:
+		if b.Text == "" {
+			return "[tool:" + b.Name + "]"
+		}
+		return "[tool:" + b.Name + " " + b.Text + "]"
+	case BlockToolResult:
+		if b.Text == "" {
+			return "[tool_result]"
+		}
+		return "[tool_result] " + b.Text
+	}
+	return b.Text
+}
 
 // Turn is one logical Q&A unit: a user prompt plus every assistant / tool
 // response that followed it until the next real user prompt. Everything we
 // need for ranking and display lives on this struct so the cache is fully
 // self-contained.
 type Turn struct {
-	File          string
-	SessionID     string
-	Project       string // cwd reported by Claude Code
-	TurnIdx       int
-	Timestamp     string
-	Slug          string
-	UserText      string
-	AssistantText string
-	Text          string // tokenised blob (user + assistant + tool names)
+	// Source names the agent that produced this transcript ("claude", "codex", …).
+	// Empty on legacy caches; treated as "claude" by consumers for backwards
+	// compatibility until the cache is rebuilt.
+	Source    string
+	File      string
+	SessionID string
+	Project   string // cwd reported by the agent
+	TurnIdx   int
+	Timestamp string
+	Slug      string
+	UserText  string
+	// Blocks holds the assistant side broken down by kind so `show` can filter
+	// (e.g. text-only chat without thinking or tool noise). Tool_result blocks
+	// from follow-up user messages live here too — they're conceptually part of
+	// the assistant turn that triggered them.
+	Blocks []Block
+	Text   string // tokenised blob (user + block renders + tool names)
 	// RootUserUUID is the uuid of the earliest user message in the session.
 	// Forks created via Claude Code's fork action copy the prefix verbatim,
 	// so sessions sharing a RootUserUUID are members of the same fork family.
+	// Codex has no fork action, so Codex turns always leave this empty.
 	RootUserUUID string
+}
+
+// AssistantText flattens every block into one string, mirroring the shape old
+// callers expected before Blocks existed. Use Blocks directly when you need to
+// filter by kind.
+func (t Turn) AssistantText() string {
+	if len(t.Blocks) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(t.Blocks))
+	for _, b := range t.Blocks {
+		if r := b.Render(); r != "" {
+			parts = append(parts, r)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// buildSearchBlob composes the indexable text for a turn from its user prompt,
+// rendered blocks, and the unique tool names invoked. Tool names are appended
+// separately so they survive tokenisation as standalone search terms — without
+// this, "Bash" would only appear inside `[tool:Bash …]` and tokenisers that
+// split on punctuation would drop it.
+func buildSearchBlob(user string, blocks []Block) string {
+	var parts []string
+	if user != "" {
+		parts = append(parts, user)
+	}
+	seenTools := map[string]struct{}{}
+	for _, b := range blocks {
+		if r := b.Render(); r != "" {
+			parts = append(parts, r)
+		}
+		if b.Kind == BlockToolUse && b.Name != "" {
+			seenTools[b.Name] = struct{}{}
+		}
+	}
+	if len(seenTools) > 0 {
+		names := make([]string, 0, len(seenTools))
+		for n := range seenTools {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		parts = append(parts, strings.Join(names, " "))
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
 }
 
 // --- JSONL records ---------------------------------------------------------
@@ -81,15 +173,15 @@ func parseSession(path string) ([]Turn, error) {
 
 	var turns []Turn
 	var (
-		sessionID     string
-		cwd           string
-		slug          string
-		rootUserUUID  string
-		inTurn        bool
-		curTimestamp  string
-		curUserText   strings.Builder
-		curAsst       strings.Builder
-		turnIdx       int
+		sessionID    string
+		cwd          string
+		slug         string
+		rootUserUUID string
+		inTurn       bool
+		curTimestamp string
+		curUserText  strings.Builder
+		curBlocks    []Block
+		turnIdx      int
 	)
 
 	flush := func() {
@@ -97,27 +189,25 @@ func parseSession(path string) ([]Turn, error) {
 			return
 		}
 		user := strings.TrimSpace(curUserText.String())
-		asst := strings.TrimSpace(curAsst.String())
-		toolNames := extractToolNames(asst)
-		blob := strings.TrimSpace(strings.Join(nonEmpty(user, asst, toolNames), "\n"))
+		blob := buildSearchBlob(user, curBlocks)
 		if blob != "" {
 			turns = append(turns, Turn{
-				File:          path,
-				SessionID:     sessionID,
-				Project:       cwd,
-				TurnIdx:       turnIdx,
-				Timestamp:     curTimestamp,
-				Slug:          slug,
-				UserText:      user,
-				AssistantText: asst,
-				Text:          blob,
-				RootUserUUID:  rootUserUUID,
+				File:         path,
+				SessionID:    sessionID,
+				Project:      cwd,
+				TurnIdx:      turnIdx,
+				Timestamp:    curTimestamp,
+				Slug:         slug,
+				UserText:     user,
+				Blocks:       curBlocks,
+				Text:         blob,
+				RootUserUUID: rootUserUUID,
 			})
 			turnIdx++
 		}
 		inTurn = false
 		curUserText.Reset()
-		curAsst.Reset()
+		curBlocks = nil
 		curTimestamp = ""
 	}
 
@@ -151,12 +241,9 @@ func parseSession(path string) ([]Turn, error) {
 			if rec.Message == nil {
 				continue
 			}
-			text, toolResultOnly := extractUserText(rec.Message.Content)
-			if toolResultOnly {
-				if text != "" {
-					curAsst.WriteString(text)
-					curAsst.WriteByte('\n')
-				}
+			text, toolResults, isToolResultOnly := extractUserContent(rec.Message.Content)
+			if isToolResultOnly {
+				curBlocks = append(curBlocks, toolResults...)
 				continue
 			}
 			// Real user message: start a new turn. The first such uuid per
@@ -173,39 +260,40 @@ func parseSession(path string) ([]Turn, error) {
 			if rec.Message == nil {
 				continue
 			}
-			text := extractAssistantText(rec.Message.Content)
-			if text != "" {
-				curAsst.WriteString(text)
-				curAsst.WriteByte('\n')
-			}
+			curBlocks = append(curBlocks, extractAssistantBlocks(rec.Message.Content)...)
 		}
 	}
 	flush()
 	return turns, scanner.Err()
 }
 
-// extractUserText returns (text, isToolResultOnly). isToolResultOnly is true
-// when the message is purely a tool_result follow-up with no user-authored
-// text; such messages must not open a new turn.
-func extractUserText(raw json.RawMessage) (string, bool) {
+// extractUserContent splits a user message into (authored text, tool_result
+// blocks, isToolResultOnly). isToolResultOnly is true when the message is
+// purely a tool_result follow-up with no user-authored text; such messages
+// must not open a new turn — their results are appended to the in-flight
+// assistant turn instead.
+func extractUserContent(raw json.RawMessage) (string, []Block, bool) {
 	if len(raw) == 0 {
-		return "", true
+		return "", nil, true
 	}
 	// The simple case: user prompt is a plain string.
 	if raw[0] == '"' {
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return "", true
+			return "", nil, true
 		}
-		return s, false
+		return s, nil, false
 	}
 	// Otherwise it's an array of content blocks.
 	var blocks []contentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return "", true
+		return "", nil, true
 	}
-	var parts []string
-	hasReal := false
+	var (
+		parts       []string
+		toolResults []Block
+		hasReal     bool
+	)
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
@@ -215,54 +303,58 @@ func extractUserText(raw json.RawMessage) (string, bool) {
 			}
 		case "tool_result":
 			if t := flattenToolResultContent(b.Content); t != "" {
-				parts = append(parts, "[tool_result] "+truncate(t, 200))
+				toolResults = append(toolResults, Block{
+					Kind: BlockToolResult,
+					Text: truncate(t, parseToolResultCap),
+				})
 			}
 		default:
 			hasReal = true
 		}
 	}
-	return strings.Join(parts, "\n"), !hasReal
+	return strings.Join(parts, "\n"), toolResults, !hasReal
 }
 
-// extractAssistantText collapses an assistant message into a searchable blob.
-// Tool uses render as "[tool:Name summary]" so tool names become searchable
-// terms, matching the behaviour of the Python reference.
-func extractAssistantText(raw json.RawMessage) string {
+// extractAssistantBlocks turns one assistant message's content into typed
+// Blocks. A bare-string content is treated as a single text block.
+func extractAssistantBlocks(raw json.RawMessage) []Block {
 	if len(raw) == 0 {
-		return ""
+		return nil
 	}
 	if raw[0] == '"' {
 		var s string
 		if err := json.Unmarshal(raw, &s); err != nil {
-			return ""
+			return nil
 		}
-		return s
+		if s == "" {
+			return nil
+		}
+		return []Block{{Kind: BlockText, Text: s}}
 	}
 	var blocks []contentBlock
 	if err := json.Unmarshal(raw, &blocks); err != nil {
-		return ""
+		return nil
 	}
-	var parts []string
+	var out []Block
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
 			if b.Text != "" {
-				parts = append(parts, b.Text)
+				out = append(out, Block{Kind: BlockText, Text: b.Text})
 			}
 		case "thinking":
 			if b.Text != "" {
-				parts = append(parts, b.Text)
+				out = append(out, Block{Kind: BlockThinking, Text: b.Text})
 			}
 		case "tool_use":
-			summary := summariseToolInput(b.Name, b.Input)
-			if summary == "" {
-				parts = append(parts, "[tool:"+b.Name+"]")
-			} else {
-				parts = append(parts, "[tool:"+b.Name+" "+summary+"]")
-			}
+			out = append(out, Block{
+				Kind: BlockToolUse,
+				Name: b.Name,
+				Text: summariseToolInput(b.Name, b.Input),
+			})
 		}
 	}
-	return strings.Join(parts, "\n")
+	return out
 }
 
 // summariseToolInput picks the most useful field from a tool's input object
@@ -287,7 +379,7 @@ func summariseToolInput(name string, input json.RawMessage) string {
 	}
 	for _, key := range prefKeys[name] {
 		if v, ok := m[key].(string); ok && v != "" {
-			return truncate(v, 80)
+			return truncate(v, parseToolInputCap)
 		}
 	}
 	// Fallback: first non-empty string field, alphabetically ordered for
@@ -299,7 +391,7 @@ func summariseToolInput(name string, input json.RawMessage) string {
 	sort.Strings(keys)
 	for _, k := range keys {
 		if v, ok := m[k].(string); ok && v != "" {
-			return truncate(v, 80)
+			return truncate(v, parseToolInputCap)
 		}
 	}
 	return ""
@@ -327,40 +419,17 @@ func flattenToolResultContent(raw json.RawMessage) string {
 	return strings.Join(parts, "\n")
 }
 
-var toolRE = regexp.MustCompile(`\[tool:([A-Za-z0-9_-]+)`)
-
-func extractToolNames(asst string) string {
-	if asst == "" {
-		return ""
-	}
-	matches := toolRE.FindAllStringSubmatch(asst, -1)
-	if len(matches) == 0 {
-		return ""
-	}
-	seen := make(map[string]struct{}, len(matches))
-	for _, m := range matches {
-		seen[m[1]] = struct{}{}
-	}
-	names := make([]string, 0, len(seen))
-	for n := range seen {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	return strings.Join(names, " ")
-}
-
-func nonEmpty(s ...string) []string {
-	out := s[:0]
-	for _, v := range s {
-		if v != "" {
-			out = append(out, v)
-		}
-	}
-	return out
-}
+// parseToolInputCap and parseToolResultCap clip large tool payloads at parse
+// time so the cache stays compact (tool results in particular can be megabytes
+// of file content). `cchist show --full` lifts both to 0 (= no clip) for one
+// re-parse so agents can recover the real content.
+var (
+	parseToolInputCap  = 80
+	parseToolResultCap = 200
+)
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 || len(s) <= n {
 		return s
 	}
 	return s[:n]

@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,7 +15,7 @@ import (
 // changes in a way that old caches can't represent. A mismatched Version on
 // load discards the cache and forces a full reparse — a few seconds of
 // one-off work, infinitely preferable to silently returning stale data.
-const cacheSchemaVersion = 2
+const cacheSchemaVersion = 4
 
 // Cache is the persisted index state. Gob keeps it compact and fast to load;
 // a typical ~10k-turn history round-trips in well under 100ms.
@@ -135,10 +135,16 @@ func saveIndex(path string, b *BM25) error {
 	})
 }
 
-// refreshCache walks the history directory, re-parses any file whose mtime
-// changed, drops files that have disappeared, and persists the updated cache.
-// Returns the cache and whether anything changed.
-func refreshCache(historyDir, cachePath string, opts refreshOptions) (*Cache, bool, error) {
+// migrateOnce makes the one-shot v2→v3 archive layout migration invisible
+// to the user — first refreshCache call per process runs it, every later
+// one is a no-op.
+var migrateOnce sync.Once
+
+// refreshCache walks every registered Source's roots, re-parses any file
+// whose mtime changed, drops files that have disappeared, and persists the
+// updated cache. Returns the cache and whether anything changed.
+func refreshCache(cachePath string, opts refreshOptions) (*Cache, bool, error) {
+	migrateOnce.Do(func() { _ = migrateLegacyArchive() })
 	cache := loadCache(cachePath)
 
 	// Fast-path: if the cache is fresh and we aren't forcing a rescan, skip
@@ -150,10 +156,9 @@ func refreshCache(historyDir, cachePath string, opts refreshOptions) (*Cache, bo
 		}
 	}
 
-	// Discover from the archive first so archive copies shadow live ones
-	// when both exist. After a PreCompact hook fires, the live transcript is
-	// rewritten by Claude; the archive still holds the pre-compact full copy.
-	found, err := discoverJSONL(conversationsDir(), historyDir)
+	// Discover from every source; each source walks archive first, live after,
+	// so archived pre-compact copies shadow rewritten live transcripts.
+	found, err := discoverAll(sources)
 	if err != nil {
 		return cache, false, err
 	}
@@ -167,7 +172,11 @@ func refreshCache(historyDir, cachePath string, opts refreshOptions) (*Cache, bo
 		if !opts.Force && ok && prev == fi.MTime {
 			continue
 		}
-		turns, err := parseSession(fi.Path)
+		src := sourceByID(fi.Source)
+		if src == nil {
+			continue
+		}
+		turns, err := src.Parse(fi.Path)
 		if err != nil {
 			if opts.Verbose {
 				fmt.Fprintf(os.Stderr, "  ! parse failed %s: %v\n", fi.Path, err)
@@ -178,7 +187,7 @@ func refreshCache(historyDir, cachePath string, opts refreshOptions) (*Cache, bo
 		cache.FileMTimes[fi.Path] = fi.MTime
 		changed = true
 		if opts.Verbose {
-			fmt.Fprintf(os.Stderr, "  + %s (%d turns)\n", filepath.Base(fi.Path), len(turns))
+			fmt.Fprintf(os.Stderr, "  + [%s] %s (%d turns)\n", fi.Source, filepath.Base(fi.Path), len(turns))
 		}
 	}
 
@@ -205,45 +214,56 @@ func refreshCache(historyDir, cachePath string, opts refreshOptions) (*Cache, bo
 }
 
 type fileInfo struct {
-	Path  string
-	MTime int64
+	Source string
+	Path   string
+	MTime  int64
 }
 
-// discoverJSONL walks every given root in priority order. The first root to
-// produce a file at a given relative path wins — subsequent roots shadow
-// nothing. We pass (archive, live), so the archive shadows Claude's live
-// transcripts once they've been mirrored.
-func discoverJSONL(roots ...string) ([]fileInfo, error) {
-	seen := make(map[string]struct{})
+// discoverAll walks every registered Source's Roots in priority order and
+// returns one fileInfo per distinct transcript. Dedup is per-source on the
+// relative path under each root: an archive copy shadows the live file of the
+// same session, but two sessions with the same relative name under different
+// sources are kept separately.
+func discoverAll(srcs []Source) ([]fileInfo, error) {
 	var out []fileInfo
-	for _, root := range roots {
-		if root == "" {
-			continue
-		}
-		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
+	for _, src := range srcs {
+		seen := make(map[string]struct{})
+		for _, root := range src.Roots() {
+			if root == "" {
+				continue
 			}
-			if d.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+			err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return nil
+				}
+				if d.IsDir() {
+					return nil
+				}
+				if !src.Match(path) {
+					return nil
+				}
+				rel, err := filepath.Rel(root, path)
+				if err != nil {
+					return nil
+				}
+				if _, dup := seen[rel]; dup {
+					return nil
+				}
+				info, err := d.Info()
+				if err != nil {
+					return nil
+				}
+				seen[rel] = struct{}{}
+				out = append(out, fileInfo{
+					Source: src.ID(),
+					Path:   path,
+					MTime:  info.ModTime().UnixNano(),
+				})
 				return nil
+			})
+			if err != nil && !os.IsNotExist(err) {
+				return nil, err
 			}
-			rel, err := filepath.Rel(root, path)
-			if err != nil {
-				return nil
-			}
-			if _, dup := seen[rel]; dup {
-				return nil
-			}
-			info, err := d.Info()
-			if err != nil {
-				return nil
-			}
-			seen[rel] = struct{}{}
-			out = append(out, fileInfo{Path: path, MTime: info.ModTime().UnixNano()})
-			return nil
-		})
-		if err != nil && !os.IsNotExist(err) {
-			return nil, err
 		}
 	}
 	return out, nil
