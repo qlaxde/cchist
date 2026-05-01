@@ -2,6 +2,8 @@
 
 Fast CLI for searching, preserving, and managing agent transcripts across every agent you run — today [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex). Indexes `~/.claude/projects/**/*.jsonl` plus `~/.codex/sessions/**/rollout-*.jsonl` with BM25, mirrors conversations + plans to a durable archive so they survive compaction and 30-day cleanups, and surfaces "loose threads" so you can close REPLs without losing track of work. Every result is tagged with its source (`[claude]` / `[codex]`).
 
+**Built for AI agents.** The default output is [TOON](https://toonformat.dev/) (Token-Oriented Object Notation) and `show` returns chat only by default — typically <2% the size of `claude --resume`'s context load while preserving enough signal to pick up old work. Pass `--format text` for the colorised human pretty-print.
+
 ## Background
 
 This project started from Eric Tramel's blog post **[Searchable Agent Memory](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/)**, which sketches an MCP server that makes Claude Code transcripts searchable via BM25. cchist takes the same core indexing idea and reshapes it:
@@ -79,16 +81,59 @@ cchist --since 7d "migration"      # recent hits only
 cchist --show-forks "…"            # don't dedup fork siblings (see below)
 ```
 
-When no hits match the default scope, cchist prints a hint pointing at `--all`.
+#### Query operators
+
+Mix structural operators with free-text terms. Operators gate the result set after BM25 ranking; pure-operator queries walk the corpus by recency.
+
+```bash
+cchist "useEffect" role:user            # term must appear in user prompts
+cchist tool:Bash kind:tool_use git      # turns that ran git via Bash
+cchist role:assistant kind:thinking deadlock   # in assistant thinking blocks
+```
+
+| operator | values |
+| --- | --- |
+| `kind:` | `text`, `thinking`, `tool_use`, `tool_result` |
+| `role:` | `user`, `assistant` |
+| `tool:` | tool name (e.g. `Bash`, `Read`, `Edit`) |
+
+When no hits match the default scope, cchist prints a hint pointing at `--all`. Pass `-q` / `--quiet` to suppress those hints when piping to another agent.
 
 ### Browse
 
 ```bash
 cchist list                           # sessions in current project, newest first
 cchist list -a                        # across all projects
-cchist show <session-prefix>          # print a full session
-cchist show <session-prefix> 12       # print just turn #12
+cchist show <session-prefix>          # default: chat only, joined into assistant_text per turn
+cchist show <session-prefix> 12       # just turn #12
 ```
+
+#### Show flags
+
+```bash
+cchist show <id> --with-thinking      # include thinking blocks
+cchist show <id> --with-tools         # include tool_use / tool_result
+cchist show <id> --all                # both of the above
+cchist show <id> --blocks             # typed block array (each carries idx)
+cchist show <id> --block 3            # one block by idx, untruncated (--full implicit)
+cchist show <id> --full               # untruncated tool inputs/results everywhere
+cchist show <id> --role user          # one side only
+```
+
+The cache stores tool inputs clipped to 80 chars and tool results clipped to 200 — small enough to stay light, lossless via `--full`. The single-block path (`--block N --full` is implicit) is the cheap recovery: ~1 KB for one full tool_result vs ~100 KB+ for re-parsing the whole session.
+
+### Output formats
+
+```bash
+cchist list --format toon             # default — agent-friendly, ~13–17% smaller than compact JSON
+cchist list --format json             # standard JSON
+cchist list --format text             # human pretty-print (was the old default)
+cchist list --json                    # alias for --format json
+```
+
+Structured outputs (`json`, `toon`) on `list` and `search` trim low-signal fields (`slug`, `file`, `first_ts`) by default. Pass `--fields all` to restore everything, or `--fields a,b,c` to pick exactly. Unknown names error so typos don't silently drop data.
+
+`show --format toon` hoists session-wide constants (`session_id`, `source`, `project`) to an envelope so they're emitted once, then turns follow as a uniform tabular array.
 
 ### Loose threads
 
@@ -205,7 +250,7 @@ Seed the archive once with `cchist archive` so pre-existing transcripts get mirr
 ├── metadata.json                                                # completion / deprecated flags
 └── current/<pid>.json                                           # SessionStart markers (Claude)
 ~/.cache/cchist/
-├── corpus.gob                                                   # parsed turns + mtime map (schema v3)
+├── corpus.gob                                                   # parsed turns + typed Blocks + mtime map (schema v4)
 └── index.gob                                                    # BM25 postings (rebuilt when corpus changes)
 ```
 
@@ -223,8 +268,8 @@ Seed the archive once with `cchist archive` so pre-existing transcripts get mirr
 ### Indexing
 
 - JSONL parse groups messages into _turns_ (one user prompt + every following assistant / tool response until the next real user prompt). `tool_result` user messages are treated as continuations, not new turns.
-- Turn text concatenates user prompt, assistant text, and tool names (rendered as `[tool:Read]`, `[tool:Bash]`, …) so tool usage becomes searchable.
-- An inverted index with standard BM25 scoring (k1=1.5, b=0.75) is held in memory and persisted as gob. Top-K via a size-bounded min-heap.
+- Each turn carries a `UserText` plus a typed `Blocks` slice — every block is one of `text`, `thinking`, `tool_use`, `tool_result`. Block-level structure is what lets `show --block N`, `kind:` query operators, and the chat-only default work without re-parsing the source.
+- A search blob (user text + rendered blocks + tool names) feeds an inverted index with standard BM25 scoring (k1=1.5, b=0.75) held in memory and persisted as gob. Top-K via a size-bounded min-heap.
 
 ### Incremental refresh
 
