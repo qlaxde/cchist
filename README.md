@@ -1,6 +1,6 @@
 # cchist
 
-Fast CLI for searching, preserving, and managing [Claude Code](https://claude.com/claude-code) session transcripts. Indexes `~/.claude/projects/**/*.jsonl` with BM25, mirrors conversations + plans to a durable archive so they survive compaction and Claude's 30-day cleanup, and surfaces "loose threads" so you can close REPLs without losing track of work.
+Fast CLI for searching, preserving, and managing agent transcripts across every agent you run — today [Claude Code](https://claude.com/claude-code) and [Codex CLI](https://github.com/openai/codex). Indexes `~/.claude/projects/**/*.jsonl` plus `~/.codex/sessions/**/rollout-*.jsonl` with BM25, mirrors conversations + plans to a durable archive so they survive compaction and 30-day cleanups, and surfaces "loose threads" so you can close REPLs without losing track of work. Every result is tagged with its source (`[claude]` / `[codex]`).
 
 ## Background
 
@@ -69,11 +69,11 @@ The prompt is deliberately explicit — every step references a specific artefac
 
 ### Search
 
-**Default scope is the current project.** `search`, `list`, and `threads` all filter to the directory you're in (matched by prefix so a subdir like `apps/admin` still resolves to its repo root). Use `--all` / `-a` to broaden.
+**Default scope is the current project, across every installed agent.** `search`, `list`, and `threads` filter to the directory you're in (matched by prefix so a subdir like `apps/admin` still resolves to its repo root) and search Claude + Codex transcripts together. Use `--all` / `-a` to broaden to every project. Each row is tagged `[claude]` or `[codex]` so you can see at a glance where a hit came from.
 
 ```bash
-cchist "sip gemini realtime"      # default: current project only
-cchist -a "sip gemini realtime"   # all projects
+cchist "sip gemini realtime"      # default: current project, both agents
+cchist -a "sip gemini realtime"   # every project, every agent
 cchist -p marketplace "…"          # filter by substring of the cwd path
 cchist --since 7d "migration"      # recent hits only
 cchist --show-forks "…"            # don't dedup fork siblings (see below)
@@ -117,6 +117,8 @@ In `threads` output, forks render as a tree with `├─` / `└─` connectors 
 
 ### Running processes
 
+Today `running` and `reap` scan for running **Claude Code** processes only — they rely on Claude's `--session-id` / `--resume` argv and the `SessionStart` hook breadcrumb. Codex process management is a planned extension.
+
 ```bash
 cchist running                        # list running claude processes with RSS + status
 cchist reap                           # SIGTERM → 5s → SIGKILL every completed-and-still-running session
@@ -131,9 +133,11 @@ cchist undeprecate <id>
 cchist purge <id>                     # DELETE from archive (irreversible)
 ```
 
-## Preservation via hooks
+## Preservation via hooks (Claude Code)
 
-Add these to `~/.claude/settings.json` to snapshot transcripts on lifecycle events:
+Claude Code fires lifecycle events; cchist listens and snapshots the transcript before Claude can truncate it. Codex CLI has no equivalent hook surface today — its rollouts are durable on disk, so `cchist archive` (or any ordinary `cchist` invocation, which refreshes the index and mirrors live files) is sufficient.
+
+Add these to `~/.claude/settings.json` to snapshot Claude transcripts on lifecycle events:
 
 ```json
 {
@@ -191,15 +195,18 @@ Seed the archive once with `cchist archive` so pre-existing transcripts get mirr
 ## Data layout
 
 ```
-~/.claude/projects/<proj-hash>/<session>.jsonl    # live (Claude writes here, auto-deleted after 30 days)
+~/.claude/projects/<proj-hash>/<session>.jsonl                  # Claude live (auto-deleted after 30 days)
+~/.codex/sessions/YYYY/MM/DD/rollout-…-<session>.jsonl         # Codex live
 ~/.local/share/cchist/
-├── conversations/<proj-hash>/<session>.jsonl     # archive (cchist writes here, kept forever)
-├── plans/<slug>.md                                # mirror of ~/.claude/plans — same 30-day risk
-├── metadata.json                                  # completion / deprecated flags
-└── current/<pid>.json                             # SessionStart markers
+├── conversations/
+│   ├── claude/<proj-hash>/<session>.jsonl                      # Claude archive (cchist writes, kept forever)
+│   └── codex/sessions/YYYY/MM/DD/rollout-…-<session>.jsonl     # Codex archive
+├── plans/<slug>.md                                              # mirror of ~/.claude/plans — same 30-day risk
+├── metadata.json                                                # completion / deprecated flags
+└── current/<pid>.json                                           # SessionStart markers (Claude)
 ~/.cache/cchist/
-├── corpus.gob                                     # parsed turns + mtime map (schema v2)
-└── index.gob                                      # BM25 postings (rebuilt when corpus changes)
+├── corpus.gob                                                   # parsed turns + mtime map (schema v3)
+└── index.gob                                                    # BM25 postings (rebuilt when corpus changes)
 ```
 
 ### Env overrides
@@ -207,6 +214,7 @@ Seed the archive once with `cchist archive` so pre-existing transcripts get mirr
 | Variable             | Default                 |
 | -------------------- | ----------------------- |
 | `CLAUDE_HISTORY_DIR` | `~/.claude/projects`    |
+| `CODEX_HOME`         | `~/.codex`              |
 | `CCHIST_CACHE`       | `~/.cache/cchist`       |
 | `CCHIST_ARCHIVE`     | `~/.local/share/cchist` |
 

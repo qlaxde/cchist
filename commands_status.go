@@ -15,6 +15,7 @@ import (
 // Holding it here avoids re-deriving per-command.
 type sessionSummary struct {
 	SessionID string
+	Source    string
 	Project   string
 	Slug      string
 	FirstTS   string
@@ -36,6 +37,7 @@ func buildSessionSummaries(cache *Cache, meta *Metadata) map[string]*sessionSumm
 			if !ok {
 				s = &sessionSummary{
 					SessionID: t.SessionID,
+					Source:    t.Source,
 					Project:   t.Project,
 					Slug:      t.Slug,
 					FirstTS:   t.Timestamp,
@@ -85,7 +87,7 @@ func markCompletion(argv []string, completed bool) error {
 	}
 	prefix := fs.Arg(0)
 
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 	})
 	if err != nil {
@@ -123,7 +125,7 @@ func cmdDone(argv []string) error {
 		return err
 	}
 
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 	})
 	if err != nil {
@@ -220,7 +222,7 @@ func setDeprecated(argv []string, on bool) error {
 		return fmt.Errorf("usage: cchist %s <session-id-prefix>",
 			cond(on, "deprecate", "undeprecate"))
 	}
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 	})
 	if err != nil {
@@ -277,7 +279,7 @@ func cmdPurge(argv []string) error {
 	if fs.NArg() == 0 {
 		return fmt.Errorf("usage: cchist purge <session-id-prefix>")
 	}
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 	})
 	if err != nil {
@@ -321,7 +323,7 @@ func cmdThreads(argv []string) error {
 		return err
 	}
 
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 		Force:        c.Reindex,
 		Verbose:      c.Verbose,
@@ -422,6 +424,7 @@ func printThreadRow(s *sessionSummary, runningByID map[string]int, branchPrefix 
 	header := strings.Join(filterEmpty([]string{
 		indent + branchPrefix,
 		statusBadge,
+		color(sourceBadge(s.Source), colorDim),
 		color(s.SessionID[:min(8, len(s.SessionID))], colorCyan),
 		shortTS(s.LastTS),
 		color(fmt.Sprintf("%4dt", s.Turns), colorDim),
@@ -441,7 +444,24 @@ func printThreadRow(s *sessionSummary, runningByID map[string]int, branchPrefix 
 		}
 		fmt.Printf("%s%s\n", previewIndent, preview)
 	}
-	fmt.Printf("%s%s\n\n", previewIndent, color("claude --resume "+s.SessionID, colorDim))
+	if resume := resumeCommand(s.Source, s.SessionID); resume != "" {
+		fmt.Printf("%s%s\n\n", previewIndent, color(resume, colorDim))
+	} else {
+		fmt.Println()
+	}
+}
+
+// resumeCommand returns the CLI one-liner that reopens the given session for
+// the named source. Empty string means "no known resume command" — we still
+// print the session but skip the paste-ready line.
+func resumeCommand(source, sessionID string) string {
+	switch source {
+	case "claude", "":
+		return "claude --resume " + sessionID
+	case "codex":
+		return "codex resume " + sessionID
+	}
+	return ""
 }
 
 func runningSessionIDs() map[string]int {

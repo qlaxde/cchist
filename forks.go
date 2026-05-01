@@ -98,7 +98,7 @@ func cmdForks(argv []string) error {
 		return err
 	}
 
-	cache, _, err := refreshCache(historyDir(), cachePath(), refreshOptions{
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
 		RescanWindow: defaultRescanWindow,
 	})
 	if err != nil {
@@ -204,7 +204,9 @@ func renderFamily(rootUUID string, members []*sessionSummary, asJSON bool) error
 			color(shortProject(m.Project), colorGreen),
 			color(m.Slug, colorDim),
 		)
-		fmt.Printf("       %s\n", color("claude --resume "+m.SessionID, colorDim))
+		if resume := resumeCommand(m.Source, m.SessionID); resume != "" {
+			fmt.Printf("       %s\n", color(resume, colorDim))
+		}
 	}
 	fmt.Println()
 	return nil

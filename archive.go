@@ -56,21 +56,98 @@ func archiveFile(src, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// archivedConversationPath returns where a given live JSONL should be mirrored
-// to. We replicate Claude's own directory tree relative to ~/.claude/projects
-// so that nested paths (e.g. <proj>/subagents/<file>.jsonl) survive intact —
-// otherwise dedup between live and archive breaks and the index double-counts.
-func archivedConversationPath(livePath string) string {
-	home, _ := os.UserHomeDir()
-	projectsRoot := filepath.Join(home, ".claude", "projects")
-	if rel, err := filepath.Rel(projectsRoot, livePath); err == nil && !strings.HasPrefix(rel, "..") {
-		return filepath.Join(conversationsDir(), rel)
+// migrateLegacyArchive relocates pre-multisource archives into the new
+// per-source layout. Before v3 the archive root was
+// <archive>/conversations/<proj-hash>/<session>.jsonl; after v3 Claude's
+// bucket is <archive>/conversations/claude/<proj-hash>/<session>.jsonl.
+// Anything already under a source's ID (claude/, codex/, unknown/) is left
+// alone, so this is safe to call on every invocation.
+func migrateLegacyArchive() error {
+	root := conversationsDir()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
 	}
-	// Fallback for paths outside the canonical projects root — keep the
-	// immediate parent so we still get a sensible, collision-resistant path.
+	reserved := map[string]struct{}{
+		"claude":  {},
+		"codex":   {},
+		"unknown": {},
+	}
+	claudeDir := filepath.Join(root, "claude")
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, skip := reserved[e.Name()]; skip {
+			continue
+		}
+		src := filepath.Join(root, e.Name())
+		dst := filepath.Join(claudeDir, e.Name())
+		if err := os.MkdirAll(claudeDir, 0o755); err != nil {
+			return err
+		}
+		// If the destination already exists (partial prior migration), fall
+		// back to moving individual files rather than rejecting the rename.
+		if _, err := os.Stat(dst); err == nil {
+			if err := mergeDirInto(src, dst); err != nil {
+				return err
+			}
+			_ = os.Remove(src)
+			continue
+		}
+		if err := os.Rename(src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mergeDirInto moves every file from src into dst, preserving relative paths.
+// Used by migrateLegacyArchive when a claude/<proj-hash> dir already exists
+// and we need to merge rather than rename over it.
+func mergeDirInto(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if info.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		// Honour the "never shrink the archive" rule: skip if the dst file
+		// already equals or exceeds the src size.
+		if di, err := os.Stat(target); err == nil {
+			if si, err := os.Stat(path); err == nil && di.Size() >= si.Size() {
+				return os.Remove(path)
+			}
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		return os.Rename(path, target)
+	})
+}
+
+// archivedConversationPath asks every registered Source where the given
+// live transcript should be mirrored. Sources that don't recognise the
+// path return "" so we fall through to the next one. The final fallback
+// buckets unknown paths under conversations/unknown/ so nothing is lost.
+func archivedConversationPath(livePath string) string {
+	for _, s := range sources {
+		if dst := s.ArchiveDst(livePath); dst != "" {
+			return dst
+		}
+	}
 	parent := filepath.Base(filepath.Dir(livePath))
 	name := filepath.Base(livePath)
-	return filepath.Join(conversationsDir(), parent, name)
+	return filepath.Join(conversationsDir(), "unknown", parent, name)
 }
 
 // archiveSessionByPath snapshots one transcript into the archive and also
@@ -153,35 +230,48 @@ func archivePlan(slug string) error {
 	return nil
 }
 
-// mirrorAll walks every live JSONL and plan and copies anything new/larger
-// into the archive. Fast because archiveFile short-circuits when the dest
-// is already at least as large as the source (the common case).
+// mirrorAll walks every source's live trees and copies anything new/larger
+// into the archive. Claude's Plans directory is mirrored too — it shares
+// Claude's 30-day cleanup risk. Fast because archiveFile short-circuits when
+// the dest is already at least as large as the source.
 func mirrorAll(verbose bool) (int, int, error) {
-	home, _ := os.UserHomeDir()
-	liveProjects := filepath.Join(home, ".claude", "projects")
-	livePlans := filepath.Join(home, ".claude", "plans")
-
 	sessions := 0
 	plans := 0
 
-	err := filepath.WalkDir(liveProjects, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".jsonl") {
-			return nil
+	for _, src := range sources {
+		// Skip the first root (archive) — it's the destination, not a live
+		// source to mirror from. Everything after that is an agent-owned
+		// live tree the agent may rewrite or prune.
+		roots := src.Roots()
+		if len(roots) < 2 {
+			continue
 		}
-		dst := archivedConversationPath(p)
-		if err := archiveFile(p, dst); err != nil {
-			if verbose {
-				fmt.Fprintf(os.Stderr, "  ! %s: %v\n", p, err)
+		for _, root := range roots[1:] {
+			err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+				if err != nil || d.IsDir() || !src.Match(p) {
+					return nil
+				}
+				dst := src.ArchiveDst(p)
+				if dst == "" {
+					return nil
+				}
+				if err := archiveFile(p, dst); err != nil {
+					if verbose {
+						fmt.Fprintf(os.Stderr, "  ! [%s] %s: %v\n", src.ID(), p, err)
+					}
+					return nil
+				}
+				sessions++
+				return nil
+			})
+			if err != nil && !os.IsNotExist(err) {
+				return sessions, plans, err
 			}
-			return nil
 		}
-		sessions++
-		return nil
-	})
-	if err != nil && !os.IsNotExist(err) {
-		return sessions, plans, err
 	}
 
+	home, _ := os.UserHomeDir()
+	livePlans := filepath.Join(home, ".claude", "plans")
 	entries, err := os.ReadDir(livePlans)
 	if err == nil {
 		for _, e := range entries {
