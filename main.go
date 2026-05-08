@@ -31,6 +31,15 @@ type commonFlags struct {
 	ShowForks         bool
 }
 
+// currentSessionID returns the Claude Code session id of the conversation
+// invoking cchist, if any. Claude Code exports this on every shell command it
+// runs, so we use it to hide the in-progress conversation from search / list /
+// threads results — agents looking up history almost never want their own
+// turns echoed back.
+func currentSessionID() string {
+	return os.Getenv("CLAUDE_CODE_SESSION_ID")
+}
+
 func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.IntVar(&c.Limit, "n", 10, "max results")
 	fs.IntVar(&c.Limit, "limit", 10, "max results")
@@ -370,6 +379,7 @@ func cmdSearch(argv []string) error {
 	meta := loadMetadata()
 	rootByID := collectRootUUIDs(cache)
 	keepFamily := familyDedupFilter(rootByID)
+	hideCurrent := currentSessionID()
 	results := make([]scoredTurn, 0, c.Limit)
 	for _, h := range hits {
 		t := turns[h.DocID]
@@ -377,6 +387,9 @@ func cmdSearch(argv []string) error {
 			continue
 		}
 		if !c.IncludeDeprecated && meta.isDeprecated(t.SessionID) {
+			continue
+		}
+		if hideCurrent != "" && t.SessionID == hideCurrent {
 			continue
 		}
 		if !c.ShowForks && !keepFamily(t.SessionID) {
@@ -557,6 +570,7 @@ func cmdList(argv []string) error {
 	cwdFilter := resolveCwdScope(&c)
 
 	meta := loadMetadata()
+	hideCurrent := currentSessionID()
 	rows := make([]*sessionRow, 0, len(byID))
 	for _, r := range byID {
 		if c.Project != "" && !strings.Contains(strings.ToLower(r.Project), strings.ToLower(c.Project)) {
@@ -572,6 +586,9 @@ func cmdList(argv []string) error {
 			}
 		}
 		if !c.IncludeDeprecated && meta.isDeprecated(r.SessionID) {
+			continue
+		}
+		if hideCurrent != "" && r.SessionID == hideCurrent {
 			continue
 		}
 		rows = append(rows, r)

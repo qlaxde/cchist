@@ -340,6 +340,7 @@ func cmdThreads(argv []string) error {
 	}
 	cwdFilter := resolveCwdScope(&c)
 
+	hideCurrent := currentSessionID()
 	rows := make([]*sessionSummary, 0, len(summaries))
 	for _, s := range summaries {
 		if !*closed {
@@ -361,6 +362,9 @@ func cmdThreads(argv []string) error {
 			if !ok || dt.Before(since) {
 				continue
 			}
+		}
+		if hideCurrent != "" && s.SessionID == hideCurrent {
+			continue
 		}
 		rows = append(rows, s)
 	}
