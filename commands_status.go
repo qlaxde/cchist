@@ -455,6 +455,178 @@ func printThreadRow(s *sessionSummary, runningByID map[string]int, branchPrefix 
 	}
 }
 
+// --- resume ----------------------------------------------------------------
+
+// cmdResume prints the resume one-liner for the most recent open thread in
+// cwd (or globally with -a). Collapses the "cchist threads → copy resume
+// line" two-step into a single call.
+func cmdResume(argv []string) error {
+	fs := flag.NewFlagSet("resume", flag.ContinueOnError)
+	var c commonFlags
+	bindCommon(fs, &c)
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+	pick, err := pickMostRecent(&c, pickOpts{excludeCurrent: true, excludeCompleted: true})
+	if err != nil {
+		return err
+	}
+	cmd := resumeCommand(pick.Source, pick.SessionID)
+	if cmd == "" {
+		return fmt.Errorf("no known resume command for source %q", pick.Source)
+	}
+	fmt.Println(cmd)
+	if !c.Quiet {
+		fmt.Fprintf(os.Stderr, "# %s  %s  %s\n",
+			color(pick.SessionID[:min(8, len(pick.SessionID))], colorCyan),
+			shortTS(pick.LastTS),
+			color(shortProject(pick.Project), colorGreen),
+		)
+	}
+	return nil
+}
+
+// --- prev ------------------------------------------------------------------
+
+// cmdPrev shows the most recent session in cwd (or -a) that isn't the live
+// one running cchist. With a query, greps that session for matching turns;
+// otherwise shows the whole session. Faster than search+show when the agent
+// just wants "what was I doing last time".
+func cmdPrev(argv []string) error {
+	fs := flag.NewFlagSet("prev", flag.ContinueOnError)
+	var c commonFlags
+	// bindCommon already wires -n/--limit to c.Limit; we reuse it as the
+	// turn-limit when passing through to show.
+	bindCommon(fs, &c)
+	role := fs.String("role", "both", "user | assistant | both")
+	withThinking := fs.Bool("with-thinking", false, "include assistant thinking blocks")
+	withTools := fs.Bool("with-tools", false, "include tool_use and tool_result blocks")
+	allContent := fs.Bool("all-blocks", false, "shorthand for --with-thinking --with-tools")
+	full := fs.Bool("full", false, "untruncated tool inputs/results")
+	// prev defaults to the LAST 10 turns — agents asking "what was I doing"
+	// want the recap, not the cold start. Pass --no-tail or --limit 0 to opt
+	// out (limit 0 = render everything).
+	tail := fs.Bool("tail", true, "with --limit, take last N turns (default true for prev)")
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+	pick, err := pickMostRecent(&c, pickOpts{excludeCurrent: true})
+	if err != nil {
+		return err
+	}
+	if !c.Quiet {
+		fmt.Fprintf(os.Stderr, "# prev: %s  %s  %s\n",
+			color(pick.SessionID[:min(8, len(pick.SessionID))], colorCyan),
+			shortTS(pick.LastTS),
+			color(shortProject(pick.Project), colorGreen),
+		)
+	}
+	// If a free-text query is present, route through search scoped to this
+	// session — same ranking, same operators agents already know.
+	if q := strings.TrimSpace(strings.Join(fs.Args(), " ")); q != "" {
+		showArgs := []string{pick.SessionID[:min(8, len(pick.SessionID))]}
+		// Just hand off to cmdShow with the prefix; query-within-prev is left
+		// to the caller via `cchist <q> -p <project-of-prev>`. Keeps prev
+		// honest about its one job.
+		_ = showArgs
+		// Honour query positional by piggy-backing on search to keep the API
+		// promise — query positional => grep within picked session.
+		searchArgs := []string{q, "--all", "-n", "20"}
+		// Project-scope the search so we hit ONLY the picked session's project.
+		searchArgs = append(searchArgs, "-p", pick.Project)
+		return cmdSearch(searchArgs)
+	}
+	// No query: render the session like cchist show would. Flags MUST precede
+	// the session-id positional or cmdShow treats them as the turn-index arg.
+	if *allContent {
+		*withThinking = true
+		*withTools = true
+	}
+	showArgs := []string{}
+	if *role != "both" {
+		showArgs = append(showArgs, "--role", *role)
+	}
+	if *withThinking {
+		showArgs = append(showArgs, "--with-thinking")
+	}
+	if *withTools {
+		showArgs = append(showArgs, "--with-tools")
+	}
+	if *full {
+		showArgs = append(showArgs, "--full")
+	}
+	if c.Limit > 0 {
+		showArgs = append(showArgs, "--limit", fmt.Sprint(c.Limit))
+		if *tail {
+			showArgs = append(showArgs, "--tail")
+		}
+	}
+	if c.Format != "" {
+		showArgs = append(showArgs, "--format", c.Format)
+	}
+	if c.JSON {
+		showArgs = append(showArgs, "--json")
+	}
+	showArgs = append(showArgs, pick.SessionID[:min(8, len(pick.SessionID))])
+	return cmdShow(showArgs)
+}
+
+// pickOpts gates the candidate set for pickMostRecent.
+type pickOpts struct {
+	excludeCurrent   bool
+	excludeCompleted bool
+}
+
+// pickMostRecent returns the most recently active session matching c's scope
+// rules (cwd by default, --all overrides). Used by resume/prev to avoid each
+// re-deriving the same selection logic.
+func pickMostRecent(c *commonFlags, opts pickOpts) (*sessionSummary, error) {
+	cache, _, err := refreshCache(cachePath(), refreshOptions{
+		RescanWindow: defaultRescanWindow,
+		Force:        c.Reindex,
+		Verbose:      c.Verbose,
+	})
+	if err != nil {
+		return nil, err
+	}
+	meta := loadMetadata()
+	summaries := buildSessionSummaries(cache, meta)
+	cwdFilter := resolveCwdScope(c)
+	hideCurrent := ""
+	if opts.excludeCurrent {
+		hideCurrent = currentSessionID()
+	}
+	var pick *sessionSummary
+	for _, s := range summaries {
+		if c.Project != "" && !strings.Contains(strings.ToLower(s.Project), strings.ToLower(c.Project)) {
+			continue
+		}
+		if cwdFilter != "" && !cwdMatches(s.Project, cwdFilter) {
+			continue
+		}
+		if opts.excludeCompleted && s.Status == "completed" {
+			continue
+		}
+		if meta.isDeprecated(s.SessionID) {
+			continue
+		}
+		if hideCurrent != "" && s.SessionID == hideCurrent {
+			continue
+		}
+		if pick == nil || s.LastTS > pick.LastTS {
+			pick = s
+		}
+	}
+	if pick == nil {
+		where := "cwd"
+		if cwdFilter == "" {
+			where = "any project"
+		}
+		return nil, fmt.Errorf("no matching session in %s — try --all", where)
+	}
+	return pick, nil
+}
+
 // resumeCommand returns the CLI one-liner that reopens the given session for
 // the named source. Empty string means "no known resume command" — we still
 // print the session but skip the paste-ready line.

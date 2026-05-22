@@ -47,6 +47,7 @@ func bindCommon(fs *flag.FlagSet, c *commonFlags) {
 	fs.StringVar(&c.Project, "project", "", "filter by project substring (matches cwd)")
 	fs.BoolVar(&c.All, "all", false, "search across all projects (default: current dir only)")
 	fs.BoolVar(&c.All, "a", false, "search across all projects (shorthand for --all)")
+	fs.BoolVar(&c.All, "global", false, "search across all projects (alias for --all)")
 	fs.StringVar(&c.Since, "since", "", "recency filter (ISO date or e.g. 7d, 12h, 2w)")
 	fs.BoolVar(&c.JSON, "json", false, "alias for --format json")
 	fs.StringVar(&c.Format, "format", "", "output format: text|json|toon (default toon)")
@@ -115,13 +116,22 @@ func run(argv []string) error {
 		"deprecate": true, "undeprecate": true, "deprecated": true,
 		"purge":   true,
 		"threads": true, "running": true, "reap": true, "forks": true,
+		"resume": true, "prev": true,
 		"-h": true, "--help": true, "help": true,
 	}
 	if len(argv) == 0 {
 		return usage(os.Stdout)
 	}
 	if !known[argv[0]] {
-		argv = append([]string{"search"}, argv...)
+		// Bare scope flags (cchist --all / -a / --global) used to error out of
+		// cmdSearch with "empty query". Agents kept tripping on this — the
+		// intent is obviously "list everything across projects", so route to
+		// list when no positional follows.
+		if onlyScopeFlags(argv) {
+			argv = append([]string{"list"}, argv...)
+		} else {
+			argv = append([]string{"search"}, argv...)
+		}
 	}
 
 	cmd := argv[0]
@@ -166,6 +176,10 @@ func run(argv []string) error {
 		return cmdReap(rest)
 	case "forks":
 		return cmdForks(rest)
+	case "resume":
+		return cmdResume(rest)
+	case "prev":
+		return cmdPrev(rest)
 	case "help", "-h", "--help":
 		return usage(os.Stdout)
 	}
@@ -173,67 +187,61 @@ func run(argv []string) error {
 }
 
 func usage(w io.Writer) error {
-	_, err := fmt.Fprint(w, `cchist — search, preserve and manage agent transcripts (Claude Code, Codex)
+	_, err := fmt.Fprint(w, `cchist — search agent transcripts (Claude Code, Codex). Tuned for AI agents.
 
-Usage:
-  cchist [query...]              BM25 search across every installed agent
-  cchist search <query...>       BM25 search
-  cchist list                    list sessions newest first
-  cchist show <session> [turn]   print a session (prefix match on id)
-    Default: chat only, joined into assistant_text per turn.
-    --role user|assistant|both     limit to one side
-    --with-thinking                include thinking blocks
-    --with-tools                   include tool_use / tool_result blocks
-    --all                          --with-thinking + --with-tools
-    --blocks                       emit typed block array (each has idx)
-    --block N                      single block by idx, untruncated (--full implicit)
-    --full                         untruncated tool inputs/results
-    --format text|json|toon        default toon
-  cchist reindex                 force full rebuild of the cache
-
-Threads / completion:
+Quick start (scope defaults to current directory; auto-widens to all if empty):
+  cchist <query...>              BM25 search (free text + operators)
+  cchist <query...> --top        search and inline the top hit's full transcript
+  cchist prev [query...]         most-recent session in cwd (excl. live), grep optional
+  cchist resume                  print the resume command for the newest open thread
+  cchist show <id-prefix> [turn] print a session by id prefix
+  cchist list                    sessions newest first
   cchist threads                 open (non-completed) sessions, with resume commands
   cchist done [id-prefix]        mark a session completed (default: most recent in cwd)
-    --family                       also mark every fork of the target complete
+
+Query operators (mix with free text):
+  kind:text|thinking|tool_use|tool_result
+  role:user|assistant
+  tool:<Name>                    only turns that called this tool
+
+Common flags (work on search / list / threads / prev):
+  -a, --all, --global            search every project (default: cwd only)
+  -p, --project S                filter by project substring
+  -n, --limit N                  max results (default 10)
+  --since SPEC                   ISO date or 7d / 12h / 2w
+  --format text|json|toon        default toon (text for humans)
+  --fields F1,F2,…               structured outputs: pick fields, or 'all'
+  -q, --quiet                    suppress stderr hints (search/list/threads)
+  --reindex                      force full reindex before running
+
+Show flags (cchist show ... | cchist prev | cchist <q> --top):
+  --role user|assistant|both     limit to one side (default both)
+  --with-thinking                include thinking blocks
+  --with-tools                   include tool_use / tool_result blocks
+  --all                          shorthand for --with-thinking --with-tools (show only)
+  --blocks                       emit typed block array (each has idx)
+  --block N                      single block by idx, untruncated (--full implicit)
+  --full                         untruncated tool inputs/results
+  -n, --limit N                  render at most N turns (replaces piping through head)
+  --tail                         with --limit, take the last N turns instead of first
+
+Less common:
   cchist complete <id-prefix>    mark completed (explicit)
   cchist uncomplete <id-prefix>  reopen a completed session
-  cchist forks [id-prefix]       list fork families (or one family if id given)
-
-Preservation:
-  cchist archive                 mirror every agent's live transcripts + Claude's plans
-  cchist hook                    Claude Code hook entry point (reads payload from stdin)
-
-Soft-hide / hard-delete:
+  cchist forks [id-prefix]       list fork families
+  cchist archive                 mirror every agent's live transcripts + plans
+  cchist hook                    Claude Code hook entry point (stdin payload)
   cchist deprecate <id-prefix>   hide from search (keeps archive copy)
   cchist undeprecate <id-prefix>
   cchist deprecated              list deprecated ids
   cchist purge <id-prefix>       DELETE from archive (irreversible)
-
-Memory / processes (Claude Code only):
   cchist running                 running claude processes with status + RSS
-  cchist reap                    SIGTERM (then SIGKILL) running-and-completed sessions
-
-Scope (search / list / threads default to the current working directory):
-  -a, --all             across all projects and every installed agent
-  -p, --project S       filter by project substring (overrides default cwd)
-
-Search query operators (mix with free text):
-  kind:text|thinking|tool_use|tool_result
-  role:user|assistant
-  tool:<Name>           only turns that called this tool
-
-Common flags:
-  -n, --limit N         max results (default 10)
-  --since SPEC          ISO date or 7d / 12h / 2w
-  --format FMT          text | json | toon  (default toon; text for humans)
-  --fields F1,F2,…      structured outputs: pick fields, or 'all'.
-                          Default omits slug/file (and first_ts on list).
-  --json                alias for --format json
-  -q, --quiet           suppress stderr hints
-  --include-deprecated  include soft-hidden sessions
-  --show-forks          don't dedup fork siblings in search results
-  -v, --verbose         log indexing progress
-  --reindex             force full reindex before running
+  cchist reap                    SIGTERM (then SIGKILL) completed-but-running sessions
+  cchist reindex                 force full rebuild of the cache
+  --include-deprecated           include soft-hidden sessions
+  --show-forks                   don't dedup fork siblings in search results
+  --json                         alias for --format json
+  -v, --verbose                  log indexing progress
 
 Env:
   CLAUDE_HISTORY_DIR  defaults to ~/.claude/projects
@@ -262,6 +270,23 @@ func indexPath() string {
 	return filepath.Join(cacheDir(), "index.gob")
 }
 
+// onlyScopeFlags returns true when argv consists solely of -a / --all /
+// --global (bare scope toggles, no positional). Used to route `cchist --all`
+// to `cchist list --all` instead of dying with "empty query".
+func onlyScopeFlags(argv []string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+	for _, a := range argv {
+		switch a {
+		case "-a", "--all", "--global":
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // hoistFlags rewrites argv so that any token starting with '-' is moved to
 // the front (preserving relative order and value-pairs). Lets users type
 // flags after positional args — e.g. `cchist "foo bar" -n 3` — which the
@@ -275,7 +300,7 @@ func hoistFlags(argv []string) []string {
 		"--with-thinking": true, "--with-tools": true,
 		"--blocks":        true,
 		"--full":          true, "--quiet": true, "-q": true,
-		"-a": true, "--all": true,
+		"-a": true, "--all": true, "--global": true,
 		"--include-deprecated": true, "--show-forks": true,
 	}
 	i := 0
@@ -306,8 +331,10 @@ func cmdSearch(argv []string) error {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	var c commonFlags
 	var context int
+	var top bool
 	bindCommon(fs, &c)
 	fs.IntVar(&context, "context", 300, "snippet width in chars")
+	fs.BoolVar(&top, "top", false, "inline the top hit's full transcript (one tool call instead of search+show)")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -317,6 +344,13 @@ func cmdSearch(argv []string) error {
 	}
 	rawQuery := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if rawQuery == "" {
+		// `cchist --all` (and similar bare-scope invocations) used to die with
+		// "empty query". The intent is clearly "list everything in scope" —
+		// agents kept tripping on the error, then re-reading --help. Route to
+		// list which uses the same scope/since/format/fields flags.
+		if c.All || c.Project != "" || c.Since != "" || c.Format != "" || c.Fields != "" || c.JSON {
+			return cmdList(argv)
+		}
 		return fmt.Errorf("empty query")
 	}
 	// Pull kind:/role:/tool: operators out before we tokenise. Free text is
@@ -378,38 +412,69 @@ func cmdSearch(argv []string) error {
 	qterms := splitWords(rankText)
 	meta := loadMetadata()
 	rootByID := collectRootUUIDs(cache)
-	keepFamily := familyDedupFilter(rootByID)
 	hideCurrent := currentSessionID()
-	results := make([]scoredTurn, 0, c.Limit)
-	for _, h := range hits {
-		t := turns[h.DocID]
-		if !matchFilters(t, c.Project, cwdFilter, since) {
-			continue
+
+	gather := func(scope string) []scoredTurn {
+		keepFamily := familyDedupFilter(rootByID)
+		out := make([]scoredTurn, 0, c.Limit)
+		for _, h := range hits {
+			t := turns[h.DocID]
+			if !matchFilters(t, c.Project, scope, since) {
+				continue
+			}
+			if !c.IncludeDeprecated && meta.isDeprecated(t.SessionID) {
+				continue
+			}
+			if hideCurrent != "" && t.SessionID == hideCurrent {
+				continue
+			}
+			if !c.ShowForks && !keepFamily(t.SessionID) {
+				continue
+			}
+			if !turnMatchesQuery(t, qf) {
+				continue
+			}
+			out = append(out, scoredTurn{Score: h.Score, Turn: t})
+			if len(out) >= c.Limit {
+				break
+			}
 		}
-		if !c.IncludeDeprecated && meta.isDeprecated(t.SessionID) {
-			continue
+		return out
+	}
+
+	results := gather(cwdFilter)
+	widened := false
+	if len(results) == 0 && cwdFilter != "" && c.Project == "" {
+		// Cwd-scope came up empty. Agents almost always want this re-run with
+		// the wider scope rather than giving up — the historical pattern is
+		// "cchist foo → 0 hits → retry with -a". Do it for them.
+		results = gather("")
+		widened = len(results) > 0
+	}
+
+	if top && len(results) > 0 {
+		if widened && !c.Quiet {
+			fmt.Fprintln(os.Stderr, color("(--top: widened scope to --all; cwd had 0 hits)", colorDim))
 		}
-		if hideCurrent != "" && t.SessionID == hideCurrent {
-			continue
-		}
-		if !c.ShowForks && !keepFamily(t.SessionID) {
-			continue
-		}
-		if !turnMatchesQuery(t, qf) {
-			continue
-		}
-		results = append(results, scoredTurn{Score: h.Score, Turn: t})
-		if len(results) >= c.Limit {
-			break
-		}
+		return emitTopHit(cache, results[0].Turn.SessionID, format)
 	}
 
 	if format == "json" || format == "toon" {
+		if widened && !c.Quiet {
+			fmt.Fprintln(os.Stderr, color("(widened scope to --all; cwd had 0 hits)", colorDim))
+		}
 		fields, err := resolveFields(c.Fields, searchDefaultFields, searchAllFields)
 		if err != nil {
 			return err
 		}
-		return emitStructured(format, buildSearchPayload(results, qterms, context, fields))
+		if err := emitStructured(format, buildSearchPayload(results, qterms, context, fields)); err != nil {
+			return err
+		}
+		if len(results) > 0 && !c.Quiet {
+			fmt.Fprintf(os.Stderr, "# next: cchist show %s   (or pass --top to inline)\n",
+				results[0].Turn.SessionID[:min(8, len(results[0].Turn.SessionID))])
+		}
+		return nil
 	}
 	if len(results) == 0 {
 		if !c.Quiet {
@@ -417,8 +482,55 @@ func cmdSearch(argv []string) error {
 		}
 		return nil
 	}
+	if widened && !c.Quiet {
+		fmt.Fprintln(os.Stderr, color("(widened scope to --all; cwd had 0 hits)", colorDim))
+	}
 	for _, r := range results {
 		printResult(r, qterms, context)
+	}
+	if !c.Quiet {
+		fmt.Fprintf(os.Stderr, "# next: cchist show %s   (or pass --top to inline)\n",
+			results[0].Turn.SessionID[:min(8, len(results[0].Turn.SessionID))])
+	}
+	return nil
+}
+
+// emitTopHit renders one session's full transcript in the given format. Used
+// by `cchist <query> --top` to collapse search-then-show into a single call.
+func emitTopHit(cache *Cache, sessionID, format string) error {
+	var file string
+	for fpath, turns := range cache.TurnsByFile {
+		for _, t := range turns {
+			if t.SessionID == sessionID {
+				file = fpath
+				break
+			}
+		}
+		if file != "" {
+			break
+		}
+	}
+	if file == "" {
+		return fmt.Errorf("top hit %s not found in cache", sessionID)
+	}
+	turns := cache.TurnsByFile[file]
+	allowedKinds := map[string]bool{BlockText: true}
+	if format == "json" || format == "toon" {
+		return emitStructured(format, buildShowPayload(turns, true, true, true, allowedKinds, -1))
+	}
+	for _, t := range turns {
+		fmt.Println(color(fmt.Sprintf("── #%d  %s  session %s ──", t.TurnIdx, shortTS(t.Timestamp), t.SessionID), colorCyan))
+		fmt.Println(color("user:", colorBold))
+		if t.UserText == "" {
+			fmt.Println("(empty)")
+		} else {
+			fmt.Println(t.UserText)
+		}
+		if asst := renderBlocks(t.Blocks, allowedKinds); asst != "" {
+			fmt.Println(color("assistant:", colorBold))
+			fmt.Println(asst)
+		}
+		fmt.Println()
 	}
 	return nil
 }
@@ -651,6 +763,9 @@ func cmdShow(argv []string) error {
 	asBlocks := fs.Bool("blocks", false, "emit typed block array instead of joined assistant_text")
 	blockIdx := fs.Int("block", -1, "single block by idx, untruncated (--full implicit)")
 	full := fs.Bool("full", false, "untruncated tool inputs/results")
+	limit := fs.Int("limit", 0, "render at most N turns (0 = all). Pair with --tail to take the last N.")
+	fs.IntVar(limit, "n", 0, "shorthand for --limit")
+	tail := fs.Bool("tail", false, "with --limit N, render the LAST N turns (default: first N)")
 	asJSON := fs.Bool("json", false, "alias for --format json")
 	formatFlag := fs.String("format", "", "output format: text|json|toon (default toon)")
 	if err := fs.Parse(argv); err != nil {
@@ -773,9 +888,24 @@ func cmdShow(argv []string) error {
 			return fmt.Errorf("no turn %d in session", turnFilter)
 		}
 	}
+	truncated := 0
+	if *limit > 0 && *limit < len(turns) {
+		truncated = len(turns) - *limit
+		if *tail {
+			turns = turns[len(turns)-*limit:]
+		} else {
+			turns = turns[:*limit]
+		}
+	}
 
 	if format == "json" || format == "toon" {
-		return emitStructured(format, buildShowPayload(turns, showUser, showAsst, joinAsst, allowedKinds, *blockIdx))
+		if err := emitStructured(format, buildShowPayload(turns, showUser, showAsst, joinAsst, allowedKinds, *blockIdx)); err != nil {
+			return err
+		}
+		if truncated > 0 {
+			fmt.Fprintf(os.Stderr, "# truncated to %d turns; %d more available — drop --limit or pass --tail\n", *limit, truncated)
+		}
+		return nil
 	}
 	for _, t := range turns {
 		fmt.Println(color(fmt.Sprintf("── #%d  %s  session %s ──", t.TurnIdx, shortTS(t.Timestamp), t.SessionID), colorCyan))
@@ -794,6 +924,9 @@ func cmdShow(argv []string) error {
 			}
 		}
 		fmt.Println()
+	}
+	if truncated > 0 {
+		fmt.Fprintf(os.Stderr, "# truncated to %d turns; %d more available — drop --limit or pass --tail\n", *limit, truncated)
 	}
 	return nil
 }
