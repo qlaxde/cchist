@@ -5,10 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 )
 
 // sessionSummary is the denormalised view used by the status commands.
@@ -22,11 +20,9 @@ type sessionSummary struct {
 	LastTS    string
 	Turns     int
 	FirstUser string
-	Status    string // "completed" or ""
-	Completed string // completedAt timestamp
 }
 
-func buildSessionSummaries(cache *Cache, meta *Metadata) map[string]*sessionSummary {
+func buildSessionSummaries(cache *Cache) map[string]*sessionSummary {
 	out := make(map[string]*sessionSummary)
 	for _, turns := range cache.TurnsByFile {
 		for _, t := range turns {
@@ -56,151 +52,7 @@ func buildSessionSummaries(cache *Cache, meta *Metadata) map[string]*sessionSumm
 			}
 		}
 	}
-	// Layer metadata on top so one source of truth lives in the summary.
-	for id, s := range out {
-		if m, ok := meta.Sessions[id]; ok {
-			s.Status = m.Status
-			s.Completed = m.CompletedAt
-		}
-	}
 	return out
-}
-
-// --- complete / uncomplete -------------------------------------------------
-
-func cmdComplete(argv []string) error {
-	return markCompletion(argv, true)
-}
-
-func cmdUncomplete(argv []string) error {
-	return markCompletion(argv, false)
-}
-
-func markCompletion(argv []string, completed bool) error {
-	fs := flag.NewFlagSet("complete", flag.ContinueOnError)
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-	if fs.NArg() == 0 {
-		return fmt.Errorf("usage: cchist %s <session-id-prefix>",
-			cond(completed, "complete", "uncomplete"))
-	}
-	prefix := fs.Arg(0)
-
-	cache, _, err := refreshCache(cachePath(), refreshOptions{
-		RescanWindow: defaultRescanWindow,
-	})
-	if err != nil {
-		return err
-	}
-	ids := collectSessionIDs(cache)
-	full, err := resolveSessionPrefix(prefix, ids)
-	if err != nil {
-		return err
-	}
-	meta := loadMetadata()
-	s := meta.session(full)
-	if completed {
-		s.Status = "completed"
-		s.CompletedAt = nowUTC()
-	} else {
-		s.Status = ""
-		s.CompletedAt = ""
-	}
-	if err := saveMetadata(meta); err != nil {
-		return err
-	}
-	word := cond(completed, "completed", "reopened")
-	fmt.Printf("%s %s\n", word, full)
-	return nil
-}
-
-// --- done (shortcut) -------------------------------------------------------
-
-func cmdDone(argv []string) error {
-	fs := flag.NewFlagSet("done", flag.ContinueOnError)
-	global := fs.Bool("global", false, "ignore cwd filter; take globally most recent session")
-	family := fs.Bool("family", false, "also mark every fork of the target session complete")
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-
-	cache, _, err := refreshCache(cachePath(), refreshOptions{
-		RescanWindow: defaultRescanWindow,
-	})
-	if err != nil {
-		return err
-	}
-	meta := loadMetadata()
-	summaries := buildSessionSummaries(cache, meta)
-	rootByID := collectRootUUIDs(cache)
-
-	// Explicit id-prefix arg wins over inference.
-	if fs.NArg() >= 1 {
-		prefix := fs.Arg(0)
-		ids := keysOf(summaries)
-		full, err := resolveSessionPrefix(prefix, ids)
-		if err != nil {
-			return err
-		}
-		return applyCompletionMaybeFamily(meta, summaries[full], summaries, rootByID, *family)
-	}
-
-	// No arg: pick the most recently active session, optionally scoped to cwd.
-	cwd, _ := os.Getwd()
-	var pick *sessionSummary
-	for _, s := range summaries {
-		if !*global && !cwdMatches(s.Project, cwd) {
-			continue
-		}
-		if s.Status == "completed" {
-			continue
-		}
-		if pick == nil || s.LastTS > pick.LastTS {
-			pick = s
-		}
-	}
-	if pick == nil {
-		if !*global {
-			return fmt.Errorf("no open session in %s — use `cchist done --global` or pass an id", cwd)
-		}
-		return fmt.Errorf("no open sessions found")
-	}
-	return applyCompletionMaybeFamily(meta, pick, summaries, rootByID, *family)
-}
-
-func applyCompletionMaybeFamily(meta *Metadata, s *sessionSummary, summaries map[string]*sessionSummary, rootByID map[string]string, family bool) error {
-	targets := []*sessionSummary{s}
-	if family {
-		targets = familyMembersOf(s.SessionID, summaries, rootByID)
-	}
-	ts := nowUTC()
-	for _, t := range targets {
-		sm := meta.session(t.SessionID)
-		sm.Status = "completed"
-		sm.CompletedAt = ts
-	}
-	if err := saveMetadata(meta); err != nil {
-		return err
-	}
-	for _, t := range targets {
-		fmt.Printf("%s  %s  %s\n",
-			color("✓ completed", colorGreen),
-			color(t.SessionID[:min(8, len(t.SessionID))], colorCyan),
-			shortProject(t.Project),
-		)
-		if t.FirstUser != "" {
-			preview := collapseSpaces(t.FirstUser)
-			if len(preview) > 80 {
-				preview = preview[:80] + "…"
-			}
-			fmt.Printf("  %s\n", preview)
-		}
-	}
-	if family && len(targets) > 1 {
-		fmt.Printf("\nclosed %d fork(s) of the same family\n", len(targets))
-	}
-	return nil
 }
 
 // --- deprecate / undeprecate / deprecated ---------------------------------
@@ -315,10 +167,6 @@ func cmdThreads(argv []string) error {
 	fs := flag.NewFlagSet("threads", flag.ContinueOnError)
 	var c commonFlags
 	bindCommon(fs, &c)
-	// --closed surfaces completed/deprecated threads too. Kept out of
-	// commonFlags because it only makes sense here — search and list don't
-	// hide completed sessions by default.
-	closed := fs.Bool("closed", false, "include completed and deprecated threads")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
@@ -332,7 +180,7 @@ func cmdThreads(argv []string) error {
 		return err
 	}
 	meta := loadMetadata()
-	summaries := buildSessionSummaries(cache, meta)
+	summaries := buildSessionSummaries(cache)
 
 	since, err := parseSince(c.Since)
 	if err != nil {
@@ -343,13 +191,8 @@ func cmdThreads(argv []string) error {
 	hideCurrent := currentSessionID()
 	rows := make([]*sessionSummary, 0, len(summaries))
 	for _, s := range summaries {
-		if !*closed {
-			if s.Status == "completed" {
-				continue
-			}
-			if meta.isDeprecated(s.SessionID) {
-				continue
-			}
+		if !c.IncludeDeprecated && meta.isDeprecated(s.SessionID) {
+			continue
 		}
 		if c.Project != "" && !strings.Contains(strings.ToLower(s.Project), strings.ToLower(c.Project)) {
 			continue
@@ -390,15 +233,14 @@ func cmdThreads(argv []string) error {
 		return nil
 	}
 
-	runningByID := runningSessionIDs()
 	for _, g := range groups {
-		printThreadRow(g.Canonical, runningByID, "", len(g.Forks)+1, 0)
+		printThreadRow(g.Canonical, "", len(g.Forks)+1, 0)
 		for i, fork := range g.Forks {
 			prefix := "├─"
 			if i == len(g.Forks)-1 {
 				prefix = "└─"
 			}
-			printThreadRow(fork, runningByID, prefix, len(g.Forks)+1, i+1)
+			printThreadRow(fork, prefix, len(g.Forks)+1, i+1)
 		}
 	}
 	return nil
@@ -408,15 +250,7 @@ func cmdThreads(argv []string) error {
 // draws the ├─ / └─ glyph when the row is a fork member; empty otherwise.
 // familyTotal > 1 adds a "fork i/N" hint so users know the session has
 // siblings without running `cchist forks`.
-func printThreadRow(s *sessionSummary, runningByID map[string]int, branchPrefix string, familyTotal, memberIdx int) {
-	statusBadge := ""
-	if s.Status == "completed" {
-		statusBadge = color("✓", colorGreen)
-	} else if _, live := runningByID[s.SessionID]; live {
-		statusBadge = color("●", colorYellow)
-	} else {
-		statusBadge = color("○", colorDim)
-	}
+func printThreadRow(s *sessionSummary, branchPrefix string, familyTotal, memberIdx int) {
 	forkBadge := ""
 	if familyTotal > 1 {
 		forkBadge = color(formatForkBadge(memberIdx, familyTotal), colorYellow)
@@ -427,7 +261,6 @@ func printThreadRow(s *sessionSummary, runningByID map[string]int, branchPrefix 
 	}
 	header := strings.Join(filterEmpty([]string{
 		indent + branchPrefix,
-		statusBadge,
 		color(sourceBadge(s.Source), colorDim),
 		color(s.SessionID[:min(8, len(s.SessionID))], colorCyan),
 		shortTS(s.LastTS),
@@ -467,7 +300,7 @@ func cmdResume(argv []string) error {
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	pick, err := pickMostRecent(&c, pickOpts{excludeCurrent: true, excludeCompleted: true})
+	pick, err := pickMostRecent(&c, pickOpts{excludeCurrent: true})
 	if err != nil {
 		return err
 	}
@@ -573,8 +406,7 @@ func cmdPrev(argv []string) error {
 
 // pickOpts gates the candidate set for pickMostRecent.
 type pickOpts struct {
-	excludeCurrent   bool
-	excludeCompleted bool
+	excludeCurrent bool
 }
 
 // pickMostRecent returns the most recently active session matching c's scope
@@ -590,7 +422,7 @@ func pickMostRecent(c *commonFlags, opts pickOpts) (*sessionSummary, error) {
 		return nil, err
 	}
 	meta := loadMetadata()
-	summaries := buildSessionSummaries(cache, meta)
+	summaries := buildSessionSummaries(cache)
 	cwdFilter := resolveCwdScope(c)
 	hideCurrent := ""
 	if opts.excludeCurrent {
@@ -602,9 +434,6 @@ func pickMostRecent(c *commonFlags, opts pickOpts) (*sessionSummary, error) {
 			continue
 		}
 		if cwdFilter != "" && !cwdMatches(s.Project, cwdFilter) {
-			continue
-		}
-		if opts.excludeCompleted && s.Status == "completed" {
 			continue
 		}
 		if meta.isDeprecated(s.SessionID) {
@@ -638,181 +467,6 @@ func resumeCommand(source, sessionID string) string {
 		return "codex resume " + sessionID
 	}
 	return ""
-}
-
-func runningSessionIDs() map[string]int {
-	procs, err := listClaudeProcesses()
-	if err != nil {
-		return map[string]int{}
-	}
-	out := make(map[string]int, len(procs))
-	// Also fold in breadcrumbs from the SessionStart hook — more reliable
-	// than argv parsing.
-	for _, m := range loadCurrentMarkers() {
-		if m.SessionID != "" && m.PID > 0 {
-			out[m.SessionID] = m.PID
-		}
-	}
-	for _, p := range procs {
-		if p.SessionID != "" {
-			out[p.SessionID] = p.PID
-		}
-	}
-	return out
-}
-
-// --- running ---------------------------------------------------------------
-
-func cmdRunning(argv []string) error {
-	fs := flag.NewFlagSet("running", flag.ContinueOnError)
-	asJSON := fs.Bool("json", false, "machine-readable output")
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-
-	procs, err := listClaudeProcesses()
-	if err != nil {
-		return err
-	}
-	markers := loadCurrentMarkers()
-	pidToMarker := make(map[int]currentMarker, len(markers))
-	for _, m := range markers {
-		pidToMarker[m.PID] = m
-	}
-
-	meta := loadMetadata()
-
-	type row struct {
-		PID       int    `json:"pid"`
-		SessionID string `json:"session_id"`
-		Project   string `json:"project"`
-		Status    string `json:"status"`
-		Uptime    string `json:"uptime"`
-		RSSMB     uint64 `json:"rss_mb"`
-	}
-	var rows []row
-	var totalRSS uint64
-	for _, p := range procs {
-		r := row{
-			PID:    p.PID,
-			Uptime: p.Etime,
-			RSSMB:  p.RSSBytes / (1024 * 1024),
-		}
-		if m, ok := pidToMarker[p.PID]; ok {
-			r.SessionID = m.SessionID
-			r.Project = m.Cwd
-		} else if p.SessionID != "" {
-			r.SessionID = p.SessionID
-		}
-		if r.SessionID != "" && meta.isCompleted(r.SessionID) {
-			r.Status = "completed"
-		} else {
-			r.Status = "open"
-		}
-		totalRSS += p.RSSBytes
-		rows = append(rows, r)
-	}
-
-	sort.Slice(rows, func(i, j int) bool { return rows[i].RSSMB > rows[j].RSSMB })
-
-	if *asJSON {
-		return json.NewEncoder(os.Stdout).Encode(rows)
-	}
-
-	if len(rows) == 0 {
-		fmt.Fprintln(os.Stderr, "no claude processes running")
-		return nil
-	}
-	fmt.Printf("%s  %s  %s  %s  %s  %s\n",
-		pad("PID", 7),
-		pad("SESSION", 9),
-		pad("STATUS", 10),
-		pad("UPTIME", 10),
-		pad("RSS", 8),
-		"PROJECT",
-	)
-	for _, r := range rows {
-		sid := r.SessionID
-		if len(sid) > 8 {
-			sid = sid[:8]
-		}
-		status := r.Status
-		if status == "completed" {
-			status = color(status, colorGreen)
-		}
-		fmt.Printf("%s  %s  %s  %s  %s  %s\n",
-			pad(fmt.Sprintf("%d", r.PID), 7),
-			color(pad(sid, 9), colorCyan),
-			pad(status, 10),
-			pad(r.Uptime, 10),
-			pad(fmt.Sprintf("%dM", r.RSSMB), 8),
-			shortProject(r.Project),
-		)
-	}
-	fmt.Printf("\n%d process%s · %d MB total\n",
-		len(rows), cond(len(rows) == 1, "", "es"), totalRSS/(1024*1024))
-	return nil
-}
-
-// --- reap ------------------------------------------------------------------
-
-func cmdReap(argv []string) error {
-	fs := flag.NewFlagSet("reap", flag.ContinueOnError)
-	dry := fs.Bool("dry-run", false, "show what would be killed without doing it")
-	if err := fs.Parse(argv); err != nil {
-		return err
-	}
-	procs, err := listClaudeProcesses()
-	if err != nil {
-		return err
-	}
-	meta := loadMetadata()
-	markers := loadCurrentMarkers()
-	pidToMarker := make(map[int]currentMarker, len(markers))
-	for _, m := range markers {
-		pidToMarker[m.PID] = m
-	}
-
-	targets := make([]claudeProcess, 0)
-	for _, p := range procs {
-		sid := p.SessionID
-		if m, ok := pidToMarker[p.PID]; ok && sid == "" {
-			sid = m.SessionID
-		}
-		if sid == "" {
-			continue // can't confirm completion without an id — never kill unknowns
-		}
-		if !meta.isCompleted(sid) {
-			continue
-		}
-		targets = append(targets, p)
-	}
-	if len(targets) == 0 {
-		fmt.Fprintln(os.Stderr, "nothing to reap — no running-and-completed sessions")
-		return nil
-	}
-	if *dry {
-		for _, t := range targets {
-			fmt.Printf("would kill pid=%d rss=%dM\n", t.PID, t.RSSBytes/(1024*1024))
-		}
-		return nil
-	}
-	killed := 0
-	var freed uint64
-	for _, t := range targets {
-		if terminate(t.PID, 5*time.Second) {
-			killed++
-			freed += t.RSSBytes
-			fmt.Printf("%s pid=%d  %s  %dM reclaimed\n",
-				color("✓", colorGreen), t.PID,
-				color(t.SessionID[:min(8, len(t.SessionID))], colorCyan),
-				t.RSSBytes/(1024*1024))
-		} else {
-			fmt.Printf("%s pid=%d did not exit\n", color("!", colorYellow), t.PID)
-		}
-	}
-	fmt.Printf("\nreaped %d, %d MB reclaimed\n", killed, freed/(1024*1024))
-	return nil
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -849,15 +503,3 @@ func cond[T any](b bool, yes, no T) T {
 	}
 	return no
 }
-
-func pad(s string, n int) string {
-	if len(s) >= n {
-		return s
-	}
-	return s + strings.Repeat(" ", n-len(s))
-}
-
-// archivedConversationPathForHome is used by the purge command when scanning
-// the archive directory; exported here so the test shim doesn't need access
-// to unexported state.
-func archivedConversationsRoot() string { return filepath.Join(archiveDir(), "conversations") }

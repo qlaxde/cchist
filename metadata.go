@@ -6,25 +6,16 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"time"
 )
 
-// Metadata persists user-managed session/plan state that doesn't belong
-// inside the transcripts themselves: completion status, soft-hides, notes.
-// A single JSON file keeps the model easy to inspect and edit by hand.
+// Metadata persists user-managed session state that doesn't belong inside the
+// transcripts themselves: soft-hides, notes. A single JSON file keeps the
+// model easy to inspect and edit by hand.
 type Metadata struct {
 	Sessions map[string]*SessionMeta `json:"sessions"`
-	Plans    map[string]*PlanMeta    `json:"plans"`
 }
 
 type SessionMeta struct {
-	Status      string `json:"status,omitempty"` // "completed" or empty (= open)
-	CompletedAt string `json:"completedAt,omitempty"`
-	Deprecated  bool   `json:"deprecated,omitempty"`
-	Note        string `json:"note,omitempty"`
-}
-
-type PlanMeta struct {
 	Deprecated bool   `json:"deprecated,omitempty"`
 	Note       string `json:"note,omitempty"`
 }
@@ -38,7 +29,6 @@ func archiveDir() string {
 }
 
 func metadataPath() string    { return filepath.Join(archiveDir(), "metadata.json") }
-func currentDir() string       { return filepath.Join(archiveDir(), "current") }
 func conversationsDir() string { return filepath.Join(archiveDir(), "conversations") }
 func plansArchiveDir() string  { return filepath.Join(archiveDir(), "plans") }
 
@@ -46,25 +36,16 @@ func plansArchiveDir() string  { return filepath.Join(archiveDir(), "plans") }
 // the file is missing or corrupt. We never bubble read errors to callers
 // because a missing metadata file is a valid starting state.
 func loadMetadata() *Metadata {
-	m := &Metadata{
-		Sessions: make(map[string]*SessionMeta),
-		Plans:    make(map[string]*PlanMeta),
-	}
+	m := &Metadata{Sessions: make(map[string]*SessionMeta)}
 	data, err := os.ReadFile(metadataPath())
 	if err != nil {
 		return m
 	}
 	if err := json.Unmarshal(data, m); err != nil {
-		return &Metadata{
-			Sessions: make(map[string]*SessionMeta),
-			Plans:    make(map[string]*PlanMeta),
-		}
+		return &Metadata{Sessions: make(map[string]*SessionMeta)}
 	}
 	if m.Sessions == nil {
 		m.Sessions = make(map[string]*SessionMeta)
-	}
-	if m.Plans == nil {
-		m.Plans = make(map[string]*PlanMeta)
 	}
 	return m
 }
@@ -95,30 +76,11 @@ func (m *Metadata) session(id string) *SessionMeta {
 	return s
 }
 
-func (m *Metadata) plan(slug string) *PlanMeta {
-	p, ok := m.Plans[slug]
-	if !ok {
-		p = &PlanMeta{}
-		m.Plans[slug] = p
-	}
-	return p
-}
-
-// isCompleted / isDeprecated are read-only accessors that treat "no entry"
-// as the default (open, not deprecated). Used in search/list filters.
-func (m *Metadata) isCompleted(id string) bool {
-	s, ok := m.Sessions[id]
-	return ok && s.Status == "completed"
-}
-
+// isDeprecated is a read-only accessor that treats "no entry" as the default
+// (not deprecated). Used in search/list filters.
 func (m *Metadata) isDeprecated(id string) bool {
 	s, ok := m.Sessions[id]
 	return ok && s.Deprecated
-}
-
-func (m *Metadata) isPlanDeprecated(slug string) bool {
-	p, ok := m.Plans[slug]
-	return ok && p.Deprecated
 }
 
 // resolveSessionPrefix returns the single session ID that starts with the
@@ -153,4 +115,3 @@ func resolveSessionPrefix(prefix string, knownIDs []string) (string, error) {
 	}
 }
 
-func nowUTC() string { return time.Now().UTC().Format(time.RFC3339) }

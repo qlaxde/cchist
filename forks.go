@@ -104,8 +104,7 @@ func cmdForks(argv []string) error {
 	if err != nil {
 		return err
 	}
-	meta := loadMetadata()
-	summaries := buildSessionSummaries(cache, meta)
+	summaries := buildSessionSummaries(cache)
 	rootByID := collectRootUUIDs(cache)
 
 	// Explicit id → show only that family.
@@ -189,16 +188,8 @@ func renderFamily(rootUUID string, members []*sessionSummary, asJSON bool) error
 		if i == len(members)-1 {
 			branch = "└─"
 		}
-		status := color("○", colorDim)
-		if m.Status == "completed" {
-			status = color("✓", colorGreen)
-		}
-		preview := collapseSpaces(m.FirstUser)
-		if len(preview) > 70 {
-			preview = preview[:70] + "…"
-		}
-		fmt.Printf("  %s %s  %s  %s  %4dt  %s  %s\n",
-			branch, status,
+		fmt.Printf("  %s  %s  %s  %4dt  %s  %s\n",
+			branch,
 			color(m.SessionID[:min(8, len(m.SessionID))], colorCyan),
 			shortTS(m.LastTS), m.Turns,
 			color(shortProject(m.Project), colorGreen),

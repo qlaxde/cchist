@@ -4,6 +4,36 @@ Fast CLI for searching, preserving, and managing agent transcripts across every 
 
 **Built for AI agents.** The default output is [TOON](https://toonformat.dev/) (Token-Oriented Object Notation) and `show` returns chat only by default — typically <2% the size of `claude --resume`'s context load while preserving enough signal to pick up old work. Pass `--format text` for the colorised human pretty-print.
 
+## Let an agent install it
+
+Paste the prompt below into a fresh Claude Code session (or any agent CLI that can read/write your filesystem and edit JSON) to install cchist end-to-end — binary, archive seed, and lifecycle hooks — without running the steps by hand:
+
+```
+Install cchist from https://github.com/qlaxde/cchist end-to-end. Do every step; stop and ask only if something fails.
+
+1. Detect my OS and CPU arch with `uname -s` and `uname -m`. Map to one of: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Refuse to proceed on any other platform.
+
+2. Download the matching binary from
+   https://github.com/qlaxde/cchist/releases/latest/download/cchist-<os>-<arch>
+   Install it at ~/.local/bin/cchist (mkdir -p the directory), chmod +x. If ~/.local/bin is not on PATH, tell me the exact shell-rc line to add.
+
+3. Verify with `cchist help` — it should print the usage banner.
+
+4. Run `cchist archive` once to snapshot my existing ~/.claude/projects transcripts and ~/.claude/plans into the durable archive. Report how many sessions and plans were archived.
+
+5. Install two lifecycle hooks in ~/.claude/settings.json: PreCompact and SessionEnd. Each runs the command
+      /Users/<me>/.local/bin/cchist hook 2>/dev/null || true
+   with timeouts of 10s each (use the absolute path — hooks don't inherit my shell PATH).
+
+   CRITICAL: READ the existing settings.json first and MERGE into the hooks object. Do NOT replace it. I probably have other hooks (formatters, MCP compressors, statusline, etc.) — preserve every one. Validate the final file with `jq -e .` before saving; abort if invalid.
+
+6. Tell me the hooks won't take effect in my already-running Claude sessions — I need to open `/hooks` once (which reloads settings) or start a new session. Offer to also add a one-liner verifier hook command I can paste into `/hooks` to confirm `cchist hook` fires.
+
+7. Report: binary path, binary size, archive totals, exactly which hook entries you added, and link me to the README for workflow commands: https://github.com/qlaxde/cchist/blob/main/README.md
+```
+
+The prompt is deliberately explicit — every step references a specific artefact, and the settings.json step spells out the merge/validate dance so the agent doesn't clobber existing hooks.
+
 ## Background
 
 This project started from Eric Tramel's blog post **[Searchable Agent Memory](https://eric-tramel.github.io/blog/2026-02-07-searchable-agent-memory/)**, which sketches an MCP server that makes Claude Code transcripts searchable via BM25. cchist takes the same core indexing idea and reshapes it:
@@ -11,7 +41,7 @@ This project started from Eric Tramel's blog post **[Searchable Agent Memory](ht
 - **CLI, not MCP** — invoked from your shell, not another agent.
 - **Go, not Python** — native startup, no interpreter overhead. Warm queries finish in ~250 ms on a 9 000-turn corpus.
 - **Persistent archive** — hooks snapshot transcripts before compaction and on session end, so the full history survives events that ordinarily lose it.
-- **Workflow features** — fork-family detection, completion status, running-process reaping. Designed to fix the "16 GB of dirty Claude processes I'm afraid to close" problem.
+- **Workflow features** — fork-family detection and loose-thread surfacing so you can close REPLs without losing track of unfinished work.
 
 ## Install
 
@@ -37,49 +67,23 @@ curl -L https://github.com/qlaxde/cchist/releases/latest/download/cchist-darwin-
 curl -L https://github.com/qlaxde/cchist/releases/latest/download/cchist-linux-amd64 -o cchist
 ```
 
-### Let an agent install it
-
-Paste the prompt below into a fresh Claude Code session (or any agent CLI that can read/write your filesystem and edit JSON) to install cchist end-to-end — binary, archive seed, and lifecycle hooks — without running the steps by hand:
-
-```
-Install cchist from https://github.com/qlaxde/cchist end-to-end. Do every step; stop and ask only if something fails.
-
-1. Detect my OS and CPU arch with `uname -s` and `uname -m`. Map to one of: darwin-arm64, darwin-amd64, linux-amd64, linux-arm64. Refuse to proceed on any other platform.
-
-2. Download the matching binary from
-   https://github.com/qlaxde/cchist/releases/latest/download/cchist-<os>-<arch>
-   Install it at ~/.local/bin/cchist (mkdir -p the directory), chmod +x. If ~/.local/bin is not on PATH, tell me the exact shell-rc line to add.
-
-3. Verify with `cchist help` — it should print the usage banner.
-
-4. Run `cchist archive` once to snapshot my existing ~/.claude/projects transcripts and ~/.claude/plans into the durable archive. Report how many sessions and plans were archived.
-
-5. Install three lifecycle hooks in ~/.claude/settings.json: PreCompact, SessionStart, SessionEnd. Each runs the command
-      /Users/<me>/.local/bin/cchist hook 2>/dev/null || true
-   with timeouts of 10s, 5s, 10s respectively (use the absolute path — hooks don't inherit my shell PATH).
-
-   CRITICAL: READ the existing settings.json first and MERGE into the hooks object. Do NOT replace it. I probably have other hooks (formatters, MCP compressors, statusline, etc.) — preserve every one. Validate the final file with `jq -e .` before saving; abort if invalid.
-
-6. Tell me the hooks won't take effect in my already-running Claude sessions — I need to open `/hooks` once (which reloads settings) or start a new session. Offer to also add a one-liner verifier hook command I can paste into `/hooks` to confirm `cchist hook` fires.
-
-7. Report: binary path, binary size, archive totals, exactly which hook entries you added, and link me to the README for workflow commands: https://github.com/qlaxde/cchist/blob/main/README.md
-```
-
-The prompt is deliberately explicit — every step references a specific artefact, and the settings.json step spells out the merge/validate dance so the agent doesn't clobber existing hooks.
-
 ## Usage
 
 ### Search
 
-**Default scope is the current project, across every installed agent.** `search`, `list`, and `threads` filter to the directory you're in (matched by prefix so a subdir like `apps/admin` still resolves to its repo root) and search Claude + Codex transcripts together. Use `--all` / `-a` to broaden to every project. Each row is tagged `[claude]` or `[codex]` so you can see at a glance where a hit came from.
+**Default scope is the current project, across every installed agent.** `search`, `list`, `threads`, and `prev` filter to the directory you're in (matched by prefix so a subdir like `apps/admin` still resolves to its repo root) and search Claude + Codex transcripts together. Use `--all` / `-a` / `--global` to broaden to every project. Each row is tagged `[claude]` or `[codex]` so you can see at a glance where a hit came from.
 
 ```bash
 cchist "sip gemini realtime"      # default: current project, both agents
-cchist -a "sip gemini realtime"   # every project, every agent
+cchist -a "sip gemini realtime"   # every project, every agent (--global is an alias)
+cchist "sip gemini realtime" --top # search + inline the top hit's transcript in one call
 cchist -p marketplace "…"          # filter by substring of the cwd path
 cchist --since 7d "migration"      # recent hits only
 cchist --show-forks "…"            # don't dedup fork siblings (see below)
+cchist --all                       # bare --all with no query lists every session
 ```
+
+When a cwd-scoped search returns zero hits, cchist automatically retries with `--all` and prints a `(widened scope to --all; cwd had 0 hits)` note on stderr. Non-empty result sets emit a `# next: cchist show <prefix>` hint pointing at the natural follow-up call. Pass `-q` / `--quiet` to suppress both.
 
 #### Query operators
 
@@ -97,8 +101,6 @@ cchist role:assistant kind:thinking deadlock   # in assistant thinking blocks
 | `role:` | `user`, `assistant` |
 | `tool:` | tool name (e.g. `Bash`, `Read`, `Edit`) |
 
-When no hits match the default scope, cchist prints a hint pointing at `--all`. Pass `-q` / `--quiet` to suppress those hints when piping to another agent.
-
 ### Browse
 
 ```bash
@@ -106,7 +108,12 @@ cchist list                           # sessions in current project, newest firs
 cchist list -a                        # across all projects
 cchist show <session-prefix>          # default: chat only, joined into assistant_text per turn
 cchist show <session-prefix> 12       # just turn #12
+cchist prev                           # most recent session in cwd (excludes the live one)
+cchist prev "migration"               # search within that previous session
+cchist resume                         # print `claude --resume <id>` for the newest open thread
 ```
+
+`prev` without a query renders the last 10 turns of the most recent session (uses `--tail` by default; pass `--limit 0` for the whole transcript). With a query it routes to a scoped search inside that session. `resume` picks the most recent open thread in cwd, excluding the live session, and prints the resume command on stdout with metadata on stderr — one paste to jump back in.
 
 #### Show flags
 
@@ -118,9 +125,11 @@ cchist show <id> --blocks             # typed block array (each carries idx)
 cchist show <id> --block 3            # one block by idx, untruncated (--full implicit)
 cchist show <id> --full               # untruncated tool inputs/results everywhere
 cchist show <id> --role user          # one side only
+cchist show <id> -n 20                # render at most 20 turns (replaces piping to head)
+cchist show <id> -n 20 --tail         # the last 20 instead of the first
 ```
 
-The cache stores tool inputs clipped to 80 chars and tool results clipped to 200 — small enough to stay light, lossless via `--full`. The single-block path (`--block N --full` is implicit) is the cheap recovery: ~1 KB for one full tool_result vs ~100 KB+ for re-parsing the whole session.
+The cache stores tool inputs clipped to 80 chars and tool results clipped to 200 — small enough to stay light, lossless via `--full`. The single-block path (`--block N --full` is implicit) is the cheap recovery: ~1 KB for one full tool_result vs ~100 KB+ for re-parsing the whole session. When `--limit` clips turns, cchist prints a truncation hint on stderr so you know more is available.
 
 ### Output formats
 
@@ -142,12 +151,10 @@ Each Claude REPL you leave open leaks ~200 MB/hour. The reason you leave them op
 ```bash
 cchist threads                        # open threads in current project
 cchist threads -a                     # across all projects
-cchist threads --closed               # include completed + deprecated
-cchist done                           # mark the most recent session complete
-cchist done --family <id>             # also complete every fork of that session
+cchist threads --include-deprecated   # also show soft-hidden sessions
 ```
 
-Output shows `●` for sessions still in memory, `○` for dormant. Each row prints its `claude --resume <id>` command so resuming is one paste.
+Each row prints its `claude --resume <id>` command so resuming is one paste. Fork siblings render under a single canonical row with `├─` / `└─` connectors so duplicate conversations collapse into a tree.
 
 ### Forks
 
@@ -159,16 +166,6 @@ cchist forks <id>                     # one family's members
 ```
 
 In `threads` output, forks render as a tree with `├─` / `└─` connectors and `fork N/M` badges. In search, duplicates are deduped by default (override with `--show-forks`).
-
-### Running processes
-
-Today `running` and `reap` scan for running **Claude Code** processes only — they rely on Claude's `--session-id` / `--resume` argv and the `SessionStart` hook breadcrumb. Codex process management is a planned extension.
-
-```bash
-cchist running                        # list running claude processes with RSS + status
-cchist reap                           # SIGTERM → 5s → SIGKILL every completed-and-still-running session
-cchist reap --dry-run                 # preview without killing
-```
 
 ### Soft-hide / hard-delete
 
@@ -199,18 +196,6 @@ Add these to `~/.claude/settings.json` to snapshot Claude transcripts on lifecyc
         ]
       }
     ],
-    "SessionStart": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cchist hook 2>/dev/null || true",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
     "SessionEnd": [
       {
         "matcher": "",
@@ -231,7 +216,6 @@ Claude Code reads stdin JSON payloads for each event; `cchist hook` dispatches b
 
 - **`PreCompact`** — snapshots the transcript before Claude rewrites it. This is the one that fixes "I lost my conversation to compaction".
 - **`SessionEnd`** — final snapshot on clean exit.
-- **`SessionStart`** — writes a PID → session marker so `cchist done` and `cchist reap` know which process is which.
 
 After editing `settings.json`, reload once via `/hooks` in an existing Claude session, or just start new sessions — they pick the hooks up automatically.
 
@@ -247,8 +231,7 @@ Seed the archive once with `cchist archive` so pre-existing transcripts get mirr
 │   ├── claude/<proj-hash>/<session>.jsonl                      # Claude archive (cchist writes, kept forever)
 │   └── codex/sessions/YYYY/MM/DD/rollout-…-<session>.jsonl     # Codex archive
 ├── plans/<slug>.md                                              # mirror of ~/.claude/plans — same 30-day risk
-├── metadata.json                                                # completion / deprecated flags
-└── current/<pid>.json                                           # SessionStart markers (Claude)
+└── metadata.json                                                # deprecated flags + notes
 ~/.cache/cchist/
 ├── corpus.gob                                                   # parsed turns + typed Blocks + mtime map (schema v4)
 └── index.gob                                                    # BM25 postings (rebuilt when corpus changes)

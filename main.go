@@ -112,10 +112,9 @@ func run(argv []string) error {
 	known := map[string]bool{
 		"search": true, "list": true, "show": true, "reindex": true,
 		"hook": true, "archive": true,
-		"complete": true, "uncomplete": true, "done": true,
 		"deprecate": true, "undeprecate": true, "deprecated": true,
 		"purge":   true,
-		"threads": true, "running": true, "reap": true, "forks": true,
+		"threads": true, "forks": true,
 		"resume": true, "prev": true,
 		"-h": true, "--help": true, "help": true,
 	}
@@ -154,12 +153,6 @@ func run(argv []string) error {
 		return cmdHook(rest)
 	case "archive":
 		return cmdArchive(rest)
-	case "complete":
-		return cmdComplete(rest)
-	case "uncomplete":
-		return cmdUncomplete(rest)
-	case "done":
-		return cmdDone(rest)
 	case "deprecate":
 		return cmdDeprecate(rest)
 	case "undeprecate":
@@ -170,10 +163,6 @@ func run(argv []string) error {
 		return cmdPurge(rest)
 	case "threads":
 		return cmdThreads(rest)
-	case "running":
-		return cmdRunning(rest)
-	case "reap":
-		return cmdReap(rest)
 	case "forks":
 		return cmdForks(rest)
 	case "resume":
@@ -196,8 +185,7 @@ Quick start (scope defaults to current directory; auto-widens to all if empty):
   cchist resume                  print the resume command for the newest open thread
   cchist show <id-prefix> [turn] print a session by id prefix
   cchist list                    sessions newest first
-  cchist threads                 open (non-completed) sessions, with resume commands
-  cchist done [id-prefix]        mark a session completed (default: most recent in cwd)
+  cchist threads                 open threads (with resume commands), forks grouped
 
 Query operators (mix with free text):
   kind:text|thinking|tool_use|tool_result
@@ -226,8 +214,6 @@ Show flags (cchist show ... | cchist prev | cchist <q> --top):
   --tail                         with --limit, take the last N turns instead of first
 
 Less common:
-  cchist complete <id-prefix>    mark completed (explicit)
-  cchist uncomplete <id-prefix>  reopen a completed session
   cchist forks [id-prefix]       list fork families
   cchist archive                 mirror every agent's live transcripts + plans
   cchist hook                    Claude Code hook entry point (stdin payload)
@@ -235,8 +221,6 @@ Less common:
   cchist undeprecate <id-prefix>
   cchist deprecated              list deprecated ids
   cchist purge <id-prefix>       DELETE from archive (irreversible)
-  cchist running                 running claude processes with status + RSS
-  cchist reap                    SIGTERM (then SIGKILL) completed-but-running sessions
   cchist reindex                 force full rebuild of the cache
   --include-deprecated           include soft-hidden sessions
   --show-forks                   don't dedup fork siblings in search results
